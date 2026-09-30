@@ -1,5 +1,3 @@
-"""Multi-agent Capture the Flag environment (Prototype 1)."""
-
 from ctf.actions import Action
 from ctf.agent import Agent, Team
 from ctf.config import CTFConfig, load_config

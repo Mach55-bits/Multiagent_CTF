@@ -1,5 +1,3 @@
-"""Pygame renderer for CTF environment state (no game logic)."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -7,7 +5,6 @@ from dataclasses import dataclass
 import pygame
 
 from ctf.agent import Agent, Team
-from ctf.config import CTFConfig
 from ctf.game_state import FlagStatus, GameState
 
 
@@ -22,8 +19,6 @@ class Layout:
 
 
 class CTFRenderer:
-    """Draws a GameState snapshot; does not mutate or simulate."""
-
     BG = (245, 245, 240)
     GRID_LINE = (210, 210, 205)
     OBSTACLE = (55, 55, 60)
@@ -38,9 +33,8 @@ class CTFRenderer:
     MUTED = (90, 90, 90)
     WIN_BANNER = (20, 120, 40)
 
-    def __init__(self, config: CTFConfig) -> None:
-        self.config = config
-        self.layout = self._compute_layout(config.width, config.height)
+    def __init__(self, grid_width: int, grid_height: int) -> None:
+        self.layout = self._compute_layout(grid_width, grid_height)
         self.font: pygame.font.Font
         self.font_sm: pygame.font.Font
         self.font_lg: pygame.font.Font

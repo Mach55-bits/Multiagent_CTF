@@ -18,10 +18,7 @@ def with_overrides(base: dict[str, Action], **overrides: Action) -> dict[str, Ac
 
 
 def build_red_capture_script(agent_ids: list[str]) -> list[dict[str, Action]]:
-    """
-    R1 routes above the center wall (x=5), captures BLUE at (9,3), returns to RED base (1,3).
-    B2 steps off the flag cell on turn 1 so tagging does not stop the pickup.
-    """
+    # R1 goes over the wall at x=5; B2 moves off the flag on step 1 (tagging enabled).
     idle = idle_actions(agent_ids)
     outbound_r1 = [Action.UP, Action.UP] + [Action.RIGHT] * 8 + [Action.DOWN] * 3
     return_home_r1 = (
@@ -55,7 +52,6 @@ def format_events(events: list[dict]) -> str:
 
 
 def format_event_message(event: dict) -> str:
-    """Human-readable single event line (from environment info['events'])."""
     kind = event.get("type", "")
     if kind == "flag_pickup":
         return f"{event['agent_id']} picked up {event['flag_team']} flag"

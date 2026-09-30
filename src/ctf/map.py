@@ -1,5 +1,3 @@
-"""Grid map representation."""
-
 from dataclasses import dataclass
 
 from ctf.config import CTFConfig
@@ -7,8 +5,6 @@ from ctf.config import CTFConfig
 
 @dataclass(frozen=True)
 class GridMap:
-    """2D grid with traversable cells and obstacles."""
-
     width: int
     height: int
     obstacles: frozenset[tuple[int, int]]
@@ -28,11 +24,7 @@ class GridMap:
         return self.in_bounds(x, y) and (x, y) not in self.obstacles
 
     def traversable_grid(self) -> list[list[bool]]:
-        """Return height x width matrix; True means traversable."""
         return [
-            [
-                self.is_traversable(x, y)
-                for x in range(self.width)
-            ]
+            [self.is_traversable(x, y) for x in range(self.width)]
             for y in range(self.height)
         ]

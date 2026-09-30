@@ -13,8 +13,6 @@ from ctf.agent import Team
 
 @dataclass
 class CTFConfig:
-    """All tunable environment parameters."""
-
     width: int = 11
     height: int = 7
     agents_per_team: int = 3
@@ -65,13 +63,9 @@ class CTFConfig:
                 self._validate_not_obstacle("blue_spawn", cell, obstacle_set)
 
         for team in (Team.RED, Team.BLUE):
-            if self._uses_generated_spawns(team):
+            auto = self.red_spawns is None if team is Team.RED else self.blue_spawns is None
+            if auto:
                 self._validate_generated_spawns(team, obstacle_set)
-
-    def _uses_generated_spawns(self, team: Team) -> bool:
-        if team is Team.RED:
-            return self.red_spawns is None
-        return self.blue_spawns is None
 
     def _validate_generated_spawns(self, team: Team, obstacle_set: set[tuple[int, int]]) -> None:
         base = self.red_base if team is Team.RED else self.blue_base
@@ -114,7 +108,6 @@ class CTFConfig:
         return [cell for _, _, _, cell in ranked]
 
     def default_spawns(self, team: Team) -> list[tuple[int, int]]:
-        """Return exactly ``agents_per_team`` spawn cells for the team."""
         if team is Team.RED and self.red_spawns is not None:
             return list(self.red_spawns)
         if team is Team.BLUE and self.blue_spawns is not None:
@@ -141,7 +134,6 @@ def _parse_cell(raw: Any, label: str) -> tuple[int, int]:
 
 
 def config_from_dict(data: dict[str, Any]) -> CTFConfig:
-    """Build :class:`CTFConfig` from a plain dictionary (e.g. YAML)."""
     obstacles = [_parse_cell(c, "obstacle") for c in data.get("obstacles", [])]
     red_base = _parse_cell(data.get("red_base", [1, 3]), "red_base")
     blue_base = _parse_cell(data.get("blue_base", [9, 3]), "blue_base")
@@ -169,7 +161,6 @@ def config_from_dict(data: dict[str, Any]) -> CTFConfig:
 
 
 def load_config(path: str | Path) -> CTFConfig:
-    """Load configuration from a YAML file."""
     with Path(path).open(encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     if not isinstance(data, dict):

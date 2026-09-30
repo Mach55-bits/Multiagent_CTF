@@ -7,10 +7,6 @@ from ctf.config import CTFConfig
 from ctf.environment import CTFEnvironment
 
 
-def _stay_all(env: CTFEnvironment) -> dict[str, Action]:
-    return {aid: Action.STAY for aid in env.config.agent_ids()}
-
-
 def test_agent_movement_right() -> None:
     config = CTFConfig(
         width=5,

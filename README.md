@@ -1,63 +1,45 @@
 # Multi-Agent CTF (Prototype 1)
 
-Lightweight, deterministic **Capture the Flag** environment for multi-agent coordination research. Prototype 1 implements only the game mechanics—no AI, RL, pathfinding, or graphics.
-
-## Requirements
-
-- [uv](https://docs.astral.sh/uv/) (Python 3.11+)
+Deterministic Capture-the-Flag grid environment for multi-agent coordination research. Core package: game rules and API only (no built-in AI). Optional Pygame demo for watching a scripted episode.
 
 ## Setup
 
-From the project root:
+Requires [uv](https://docs.astral.sh/uv/) (Python 3.11+).
 
 ```bash
 uv sync --extra dev
 ```
 
-This installs the `ctf` package and development dependencies (pytest).
-
-## Run tests
+## Tests
 
 ```bash
 uv run pytest
 ```
 
-## Run demo
+## Text demo
+
+Scripted episode (RED captures BLUE flag and wins):
 
 ```bash
 uv run python scripts/run_demo.py
 ```
 
-The demo loads `configs/default.yaml`, resets the environment, applies a short scripted move sequence, and prints agent positions and episode status.
-
-## Run visualization (Pygame)
+## Visualization
 
 ```bash
 uv run python visualization/demo.py
 ```
 
-Controls: **SPACE** pause/resume, **ESC** quit, **R** restart. Uses the same scripted scenario as `scripts/run_demo.py`.
+SPACE = pause/resume, ESC = quit, R = restart.
 
-## Project layout
+## Documentation
 
-- `src/ctf/` — environment implementation
-- `configs/default.yaml` — default grid, spawns, and rules
-- `tests/` — deterministic unit tests
-- `visualization/` — Pygame demo layer (not part of core env)
-- `scripts/demo_scenario.py` — shared deterministic action script
-- `docs/environment.md` — rules and API notes
+Full Prototype 1 spec: [docs/environment.md](docs/environment.md)
 
-## Quick usage
+## Layout
 
-```python
-from ctf import Action, CTFEnvironment, load_config
-
-env = CTFEnvironment(load_config("configs/default.yaml"))
-state = env.reset()
-
-while not env.done:
-    actions = {aid: Action.STAY for aid in env.config.agent_ids()}
-    state, rewards, done, info = env.step(actions)
-```
-
-See `docs/environment.md` for full details.
+- `src/ctf/` — environment
+- `configs/default.yaml` — default map and rules
+- `scripts/demo_scenario.py` — shared action script for demos
+- `visualization/` — Pygame layer
+- `tests/`

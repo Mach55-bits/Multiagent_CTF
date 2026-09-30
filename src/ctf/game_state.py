@@ -11,16 +11,12 @@ from ctf.map import GridMap
 
 
 class FlagStatus(str, Enum):
-    """Where a team's flag currently is."""
-
     AT_BASE = "AT_BASE"
     CARRIED = "CARRIED"
 
 
 @dataclass(frozen=True)
 class Flag:
-    """Flag owned by ``team`` (the team whose base holds this flag)."""
-
     team: Team
     status: FlagStatus
     x: int
@@ -49,8 +45,6 @@ class Flag:
 
 @dataclass
 class GameState:
-    """Complete CTF state at a single timestep."""
-
     grid: GridMap
     agents: dict[str, Agent]
     flags: dict[Team, Flag]

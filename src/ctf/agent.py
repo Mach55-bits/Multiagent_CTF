@@ -1,12 +1,8 @@
-"""Agent and team models."""
-
 from dataclasses import dataclass
 from enum import Enum
 
 
 class Team(str, Enum):
-    """Team identifier."""
-
     RED = "RED"
     BLUE = "BLUE"
 
@@ -17,8 +13,6 @@ class Team(str, Enum):
 
 @dataclass(frozen=True)
 class Agent:
-    """Minimal agent state tracked by the environment."""
-
     agent_id: str
     team: Team
     x: int

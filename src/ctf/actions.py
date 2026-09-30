@@ -1,11 +1,7 @@
-"""Agent action definitions."""
-
 from enum import Enum
 
 
 class Action(str, Enum):
-    """Discrete movement actions for each agent."""
-
     UP = "UP"
     DOWN = "DOWN"
     LEFT = "LEFT"
@@ -13,7 +9,6 @@ class Action(str, Enum):
     STAY = "STAY"
 
     def delta(self) -> tuple[int, int]:
-        """Return (dx, dy) grid delta for this action."""
         if self is Action.UP:
             return (0, -1)
         if self is Action.DOWN:

@@ -1,31 +1,21 @@
-"""Observation builders (extensible for future partial views)."""
+"""Observation builders for strategy code."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any
 
 from ctf.agent import Agent, Team
 from ctf.game_state import Flag, GameState
 
 
 class ObservationMode(str, Enum):
-    """Supported observation modes."""
-
     GLOBAL = "global"
-
-
-class Observation(Protocol):
-    """Protocol for observation payloads returned to strategies."""
-
-    def to_dict(self) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
 class GlobalObservation:
-    """Full environment state exposed to controllers."""
-
     mode: ObservationMode
     width: int
     height: int
@@ -69,7 +59,12 @@ class GlobalObservation:
         }
 
 
-def build_global_observation(state: GameState) -> GlobalObservation:
+def build_observation(
+    state: GameState,
+    mode: ObservationMode = ObservationMode.GLOBAL,
+) -> GlobalObservation:
+    if mode is not ObservationMode.GLOBAL:
+        raise ValueError(f"Unsupported observation mode: {mode}")
     return GlobalObservation(
         mode=ObservationMode.GLOBAL,
         width=state.grid.width,
@@ -86,13 +81,3 @@ def build_global_observation(state: GameState) -> GlobalObservation:
         truncation=state.truncation,
         tagging_enabled=state.tagging_enabled,
     )
-
-
-def build_observation(
-    state: GameState,
-    mode: ObservationMode = ObservationMode.GLOBAL,
-) -> Observation:
-    """Build an observation for the given mode."""
-    if mode is ObservationMode.GLOBAL:
-        return build_global_observation(state)
-    raise ValueError(f"Unsupported observation mode: {mode}")

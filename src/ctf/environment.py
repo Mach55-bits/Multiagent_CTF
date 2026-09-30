@@ -13,13 +13,7 @@ from ctf.observations import GlobalObservation, ObservationMode, build_observati
 
 
 class CTFEnvironment:
-    """
-    Discrete multi-agent Capture the Flag environment (Prototype 1).
-
-    Episode dynamics are fully deterministic from configuration and submitted
-    actions. The internal ``_rng`` (see ``reset``) is reserved for future
-    procedural setup and does not affect ``step`` in Prototype 1.
-    """
+    """Discrete multi-agent CTF simulator (Prototype 1)."""
 
     def __init__(self, config: CTFConfig) -> None:
         self.config = config
@@ -28,7 +22,6 @@ class CTFEnvironment:
 
     @property
     def state(self) -> GameState:
-        """Return a snapshot of the current state (does not alias internal storage)."""
         if self._state is None:
             raise RuntimeError("Environment not reset; call reset() first")
         return self._state.copy()
@@ -38,12 +31,7 @@ class CTFEnvironment:
         return self._state is not None and self._state.terminated
 
     def reset(self, *, seed: int | None = None) -> GameState:
-        """
-        Reset the episode. Optionally override the random seed.
-
-        Reseeds ``self._rng`` for future random map/spawn helpers; Prototype 1
-        gameplay does not consume RNG state during ``step``.
-        """
+        # Reseeds _rng for possible future procedural setup; step() does not use it yet.
         if seed is not None:
             self._rng = random.Random(seed)
         else:
@@ -54,17 +42,12 @@ class CTFEnvironment:
     def observe(self, mode: ObservationMode = ObservationMode.GLOBAL) -> GlobalObservation:
         if self._state is None:
             raise RuntimeError("Environment not reset; call reset() first")
-        return build_observation(self._state, mode=mode)  # type: ignore[return-value]
+        return build_observation(self._state, mode=mode)
 
     def step(
         self,
         actions: dict[str, Action | str],
     ) -> tuple[GameState, dict[str, float], bool, dict[str, Any]]:
-        """
-        Apply one simultaneous step.
-
-        Returns ``(state, rewards, done, info)``. Rewards are zero in Prototype 1.
-        """
         if self._state is None:
             raise RuntimeError("Environment not reset; call reset() first")
         if self._state.terminated:
@@ -76,7 +59,10 @@ class CTFEnvironment:
         info: dict[str, Any] = {"rejected_moves": {}, "events": events}
 
         proposals = self._propose_moves(state, parsed, info)
-        state.agents = self._apply_moves(state, proposals)
+        state.agents = {
+            aid: agent.with_position(*proposals[aid])
+            for aid, agent in state.agents.items()
+        }
 
         self._sync_carried_flag_positions(state)
         self._handle_flag_pickups(state, events)
@@ -139,17 +125,6 @@ class CTFEnvironment:
                 proposals[aid] = (nx, ny)
 
         return proposals
-
-    def _apply_moves(
-        self,
-        state: GameState,
-        proposals: dict[str, tuple[int, int]],
-    ) -> dict[str, Agent]:
-        updated: dict[str, Agent] = {}
-        for aid, agent in state.agents.items():
-            x, y = proposals[aid]
-            updated[aid] = agent.with_position(x, y)
-        return updated
 
     def _sync_carried_flag_positions(self, state: GameState) -> None:
         for team, flag in list(state.flags.items()):

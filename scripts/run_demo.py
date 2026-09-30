@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a deterministic full Capture the Flag episode (no AI / no GUI)."""
+"""Run a deterministic full Capture the Flag episode (no strategies / no GUI)."""
 
 from __future__ import annotations
 
@@ -8,65 +8,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-from ctf.actions import Action  # noqa: E402
 from ctf.agent import Team  # noqa: E402
 from ctf.config import load_config  # noqa: E402
 from ctf.environment import CTFEnvironment  # noqa: E402
-from ctf.game_state import FlagStatus  # noqa: E402
-
-
-def _idle_actions(agent_ids: list[str]) -> dict[str, Action]:
-    return {aid: Action.STAY for aid in agent_ids}
-
-
-def _with_overrides(base: dict[str, Action], **overrides: Action) -> dict[str, Action]:
-    actions = dict(base)
-    actions.update(overrides)
-    return actions
-
-
-def _flag_summary(state) -> str:
-    parts: list[str] = []
-    for team in (Team.RED, Team.BLUE):
-        flag = state.flags[team]
-        if flag.status is FlagStatus.CARRIED:
-            parts.append(f"{team.value} flag CARRIED by {flag.carrier_id} @ ({flag.x},{flag.y})")
-        else:
-            parts.append(f"{team.value} flag AT_BASE @ ({flag.x},{flag.y})")
-    return "; ".join(parts)
-
-
-def _format_events(events: list[dict]) -> str:
-    if not events:
-        return "(none)"
-    return ", ".join(
-        f"{e['type']}"
-        + (f"[{e.get('agent_id', '')}]" if e.get("agent_id") else "")
-        + (f" reason={e['reason']}" if e.get("reason") else "")
-        for e in events
-    )
-
-
-def _build_red_capture_script(agent_ids: list[str]) -> list[dict[str, Action]]:
-    """
-    R1 routes above the center wall (x=5), captures BLUE at (9,3), returns to RED base (1,3).
-    B2 steps off the flag cell on turn 1 so tagging does not stop the pickup.
-    """
-    idle = _idle_actions(agent_ids)
-    outbound_r1 = [Action.UP, Action.UP] + [Action.RIGHT] * 8 + [Action.DOWN] * 3
-    # After pickup at (9,3), step LEFT before moving up — avoids defenders at (9,2).
-    return_home_r1 = (
-        [Action.LEFT] + [Action.UP] * 3 + [Action.LEFT] * 7 + [Action.DOWN] * 3
-    )
-
-    script: list[dict[str, Action]] = []
-    script.append(_with_overrides(idle, R1=Action.UP, B2=Action.UP))
-    for move in outbound_r1[1:]:
-        script.append(_with_overrides(idle, R1=move))
-    for move in return_home_r1:
-        script.append(_with_overrides(idle, R1=move))
-    return script
+from demo_scenario import (  # noqa: E402
+    build_red_capture_script,
+    flag_summary,
+    format_events,
+)
 
 
 def main() -> None:
@@ -75,13 +26,13 @@ def main() -> None:
     env = CTFEnvironment(config)
     state = env.reset()
     agent_ids = config.agent_ids()
-    script = _build_red_capture_script(agent_ids)
+    script = build_red_capture_script(agent_ids)
 
     print("=== Multi-Agent CTF — Prototype 1 Demo (RED flag capture) ===")
     print(f"Grid: {config.width}x{config.height}, seed={config.seed}, tagging={config.tagging_enabled}")
     print(f"RED base {config.red_base}, BLUE base {config.blue_base}")
     print(f"Agents: {', '.join(sorted(state.agents.keys()))}")
-    print(f"Start: {_flag_summary(state)}")
+    print(f"Start: {flag_summary(state)}")
     print(f"R1 start @ ({state.agents['R1'].x},{state.agents['R1'].y})")
     print()
 
@@ -93,9 +44,9 @@ def main() -> None:
         r1 = state.agents["R1"]
         print(
             f"timestep={state.timestep} | R1=({r1.x},{r1.y}) carrying={r1.carrying_flag} "
-            f"active={r1.active} | {_flag_summary(state)}"
+            f"active={r1.active} | {flag_summary(state)}"
         )
-        print(f"  events: {_format_events(last_info['events'])}")
+        print(f"  events: {format_events(last_info['events'])}")
         if last_info["rejected_moves"]:
             print(f"  rejected: {last_info['rejected_moves']}")
 

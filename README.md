@@ -30,11 +30,21 @@ uv run python scripts/run_demo.py
 
 The demo loads `configs/default.yaml`, resets the environment, applies a short scripted move sequence, and prints agent positions and episode status.
 
+## Run visualization (Pygame)
+
+```bash
+uv run python visualization/demo.py
+```
+
+Controls: **SPACE** pause/resume, **ESC** quit, **R** restart. Uses the same scripted scenario as `scripts/run_demo.py`.
+
 ## Project layout
 
 - `src/ctf/` — environment implementation
 - `configs/default.yaml` — default grid, spawns, and rules
 - `tests/` — deterministic unit tests
+- `visualization/` — Pygame demo layer (not part of core env)
+- `scripts/demo_scenario.py` — shared deterministic action script
 - `docs/environment.md` — rules and API notes
 
 ## Quick usage

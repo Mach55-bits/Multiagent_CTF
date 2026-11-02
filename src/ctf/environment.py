@@ -9,7 +9,7 @@ from ctf.actions import Action
 from ctf.agent import Agent, Team
 from ctf.config import CTFConfig
 from ctf.game_state import FlagStatus, GameState
-from ctf.observations import GlobalObservation, ObservationMode, build_observation
+from ctf.observations import ObservationMode, TeamObservation, build_observation
 
 
 class CTFEnvironment:
@@ -39,10 +39,21 @@ class CTFEnvironment:
         self._state = GameState.initial(self.config)
         return self._state.copy()
 
-    def observe(self, mode: ObservationMode = ObservationMode.GLOBAL) -> GlobalObservation:
+    def observe(
+        self,
+        mode: ObservationMode = ObservationMode.GLOBAL,
+        *,
+        team: Team | None = None,
+        visibility_radius: int | None = None,
+    ) -> TeamObservation:
         if self._state is None:
             raise RuntimeError("Environment not reset; call reset() first")
-        return build_observation(self._state, mode=mode)
+        kwargs: dict = {}
+        if team is not None:
+            kwargs["team"] = team
+        if visibility_radius is not None:
+            kwargs["visibility_radius"] = visibility_radius
+        return build_observation(self._state, mode=mode, **kwargs)
 
     def step(
         self,

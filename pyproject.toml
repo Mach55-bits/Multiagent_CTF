@@ -23,6 +23,8 @@ packages = ["src/ctf"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/ctf" = "ctf"
+"src/strategies" = "strategies"
+"src/coordination" = "coordination"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

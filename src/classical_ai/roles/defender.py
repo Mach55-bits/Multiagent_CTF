@@ -1,3 +1,4 @@
+
 from ctf.actions import Action
 from ctf.agent import Team
 from ctf.game_state import FlagStatus
@@ -10,6 +11,10 @@ from classical_ai.pathfinding import next_action
 
 
 class DefenderRole:
+    """
+    Defensive role responsible for protecting the team's flag
+    and intercepting visible enemy flag carriers.
+    """
 
     def __init__(self, shared_map: SharedTeamMap | None = None):
         self.shared_map = shared_map
@@ -18,9 +23,9 @@ class DefenderRole:
         self,
         observation: TeamObservation,
         team: Team,
+        start: tuple[int, int],
     ) -> tuple[int, int] | None:
 
-        # Finding visible enemy agents carrying a flag.
         enemy_carriers = [
             agent
             for agent in observation.agents.values()
@@ -30,19 +35,16 @@ class DefenderRole:
         ]
 
         if enemy_carriers:
-            enemy_carriers.sort(
+            nearest_enemy = min(
+                enemy_carriers,
                 key=lambda agent: (
-                    agent.x,
-                    agent.y,
-                )
+                    abs(agent.x - start[0]) +
+                    abs(agent.y - start[1])
+                ),
             )
 
-            return (
-                enemy_carriers[0].x,
-                enemy_carriers[0].y,
-            )
+            return (nearest_enemy.x, nearest_enemy.y)
 
-        # Checking whether our own flag has been captured.
         own_flag = observation.flags.get(team)
 
         if own_flag is not None and own_flag.status == FlagStatus.CARRIED:
@@ -75,20 +77,21 @@ class DefenderRole:
 
         start = (agent.x, agent.y)
 
-        # Calculating movement costs based on enemy positions and accumulated team knowledge.
         influence = build_influence_map(
             observation=observation,
             team=team,
             shared_map=self.shared_map,
         )
 
-        # Prioritizing intercepting enemies carrying our flag.
-        target = self.find_threat(observation, team)
+        target = self.find_threat(
+            observation=observation,
+            team=team,
+            start=start,
+        )
 
         if target is None:
             target = self.get_defensive_position(observation, team)
 
-        # Moving towards the defensive target using A*.
         return next_action(
             start=start,
             goal=target,

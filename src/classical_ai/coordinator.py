@@ -12,7 +12,7 @@ from ctf.observations import (
 from coordination.shared_map import (
     TeamSharedMaps,
     build_scout_view,
-    update_shared_map_from_partial,
+    update_shared_map_from_partial_team,
 )
 
 from classical_ai.roles.attacker import AttackerRole
@@ -21,12 +21,6 @@ from classical_ai.roles.scout import ScoutRole
 
 
 class ClassicalCoordinator:
-    """
-    Coordinates the agents belonging to a team.
-
-    Assigns roles, maintains shared team knowledge,
-    and collects actions from individual role controllers.
-    """
 
     VALID_ROLES = {"attacker", "defender", "scout"}
 
@@ -37,13 +31,8 @@ class ClassicalCoordinator:
         role_assignments: dict[Team, dict[str, str]] | None = None,
     ) -> None:
 
-        # Maintain independent maps for RED and BLUE.
         self.team_maps = TeamSharedMaps(width, height)
-
-        # Optional manually specified role assignments.
         self.role_assignments = role_assignments or {}
-
-        # Store role controller instances separately for each team.
         self.role_controllers = {}
 
         self.width = width
@@ -55,7 +44,6 @@ class ClassicalCoordinator:
         team: Team,
     ) -> dict[str, str]:
 
-        # Use manually configured assignments when provided.
         if team in self.role_assignments:
             assignments = self.role_assignments[team]
 
@@ -65,7 +53,6 @@ class ClassicalCoordinator:
 
             return assignments
 
-        # Automatically assign roles to friendly agents.
         agent_ids = sorted(
             agent.agent_id
             for agent in observation.agents.values()
@@ -77,14 +64,11 @@ class ClassicalCoordinator:
         if not agent_ids:
             return assignments
 
-        # First agent: attacker.
         assignments[agent_ids[0]] = "attacker"
 
-        # Second agent: defender.
         if len(agent_ids) >= 2:
             assignments[agent_ids[1]] = "defender"
 
-        # Remaining agents: scouts.
         for agent_id in agent_ids[2:]:
             assignments[agent_id] = "scout"
 
@@ -113,16 +97,16 @@ class ClassicalCoordinator:
 
         if isinstance(observation, PartialTeamObservation):
 
-            # Merge all friendly agents' visible information.
-            update_shared_map_from_partial(
+            if observation.team is not team:
+                raise ValueError("Observation belongs to a different team")
+
+            update_shared_map_from_partial_team(
                 shared_map,
                 observation,
             )
 
         elif isinstance(observation, GlobalObservation):
 
-            # Simulate individual agent visibility even when
-            # the strategy receives a global observation.
             for agent_id, agent in observation.agents.items():
 
                 if agent.team is not team or not agent.active:
@@ -148,7 +132,6 @@ class ClassicalCoordinator:
 
         self.initialize_roles(team)
 
-        # Update shared knowledge before making decisions.
         self.update_team_knowledge(observation, team)
 
         assignments = self.get_role_assignments(observation, team)

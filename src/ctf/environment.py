@@ -31,12 +31,21 @@ class CTFEnvironment:
         return self._state is not None and self._state.terminated
 
     def reset(self, *, seed: int | None = None) -> GameState:
-        # Reseeds _rng for possible future procedural setup; step() does not use it yet.
+        """Start a new episode.
+
+        ``seed`` (re)seeds the environment's private RNG. Without it the RNG stream
+        simply continues, so consecutive ``reset()`` calls give different episodes
+        when ``spawn_mode`` is random, yet the whole sequence is reproducible from
+        ``config.seed`` (or from the last explicit ``seed``). ``step()`` never uses
+        the RNG: given the same spawns and actions, transitions are deterministic.
+        """
         if seed is not None:
             self._rng = random.Random(seed)
-        else:
-            self._rng = random.Random(self.config.seed)
-        self._state = GameState.initial(self.config)
+        self._state = GameState.initial(
+            self.config,
+            red_spawns=self.config.sample_spawns(Team.RED, self._rng),
+            blue_spawns=self.config.sample_spawns(Team.BLUE, self._rng),
+        )
         return self._state.copy()
 
     def observe(
@@ -46,14 +55,12 @@ class CTFEnvironment:
         team: Team | None = None,
         visibility_radius: int | None = None,
     ) -> TeamObservation:
+        """Observation of the current state. Radius defaults to ``config.visibility_radius``."""
         if self._state is None:
             raise RuntimeError("Environment not reset; call reset() first")
-        kwargs: dict = {}
-        if team is not None:
-            kwargs["team"] = team
-        if visibility_radius is not None:
-            kwargs["visibility_radius"] = visibility_radius
-        return build_observation(self._state, mode=mode, **kwargs)
+        return build_observation(
+            self._state, mode=mode, team=team, visibility_radius=visibility_radius
+        )
 
     def step(
         self,
@@ -99,7 +106,7 @@ class CTFEnvironment:
     def _parse_actions(self, actions: dict[str, Action | str]) -> dict[str, Action]:
         parsed: dict[str, Action] = {}
         for raw_id, raw_action in actions.items():
-            if raw_id not in self.config.agent_ids() and raw_id not in self._state.agents:
+            if raw_id not in self._state.agents:
                 raise KeyError(f"Unknown agent id: {raw_id}")
             action = raw_action if isinstance(raw_action, Action) else Action(raw_action)
             parsed[raw_id] = action

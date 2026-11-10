@@ -16,7 +16,7 @@ Lightweight testbed for multi-agent coordination and adversarial play on a discr
 | Obstacles | Configurable blocked cells |
 | Bases | One base cell per team (spawn / scoring reference) |
 | Flags | **One flag per team**, initially at that team’s base |
-| Parameters | Grid size, spawns, obstacles, tagging, episode cap, seed — via `CTFConfig` / YAML |
+| Parameters | Grid size, spawns, spawn randomization, obstacles, tagging, episode cap, visibility radius, seed — via `CTFConfig` / YAML |
 
 The shipped demo configuration is `configs/default.yaml` (11×7 grid, center wall obstacle column, explicit spawns).
 
@@ -76,6 +76,16 @@ If **not** provided, the environment generates **exactly** `agents_per_team` spa
 - RED: `(1,2)`, `(1,3)`, `(1,4)`
 - BLUE: `(9,2)`, `(9,3)`, `(9,4)`
 
+**Spawn randomization** (`spawn_mode`, applied at every `reset()` using the environment's seeded RNG):
+
+| `spawn_mode` | Behavior |
+|--------------|----------|
+| `fixed` (default) | Use the spawn list above (or the cells nearest the base). Identical every episode. |
+| `shuffle` | Same cells, randomly re-assigned among the team's agents. |
+| `near_base` | Distinct random cells within `spawn_radius` (Manhattan) of the base, restricted to the team's home zone (strictly closer to own base than to the enemy base). `spawn_allow_base` controls whether the flag cell itself is allowed. Ignores explicit spawn lists. |
+
+Construction fails if `near_base` cannot find `agents_per_team` valid cells.
+
 ### 3.6 Tagging Configuration
 
 | Parameter | Default (code) | `configs/default.yaml` |
@@ -92,6 +102,18 @@ When enabled, an opposing active agent on the same cell as a flag carrier tags t
 | `seed` | 42 | 42 |
 
 If `timestep` reaches `max_episode_steps` without a win, the episode ends with `truncation=True`, `winner=None`.
+
+### 3.8 Visibility
+
+| Parameter | Default (code) | `configs/default.yaml` |
+|-----------|----------------|-------------------------|
+| `visibility_radius` | 3 | 3 |
+
+Manhattan radius used by `ObservationMode.PARTIAL` (see §6). Copied into `GameState.visibility_radius` at reset; `observe(..., visibility_radius=r)` can override it per call.
+
+### 3.9 Defaults and strict parsing
+
+Defaults are declared once, in the `CTFConfig` dataclass. YAML files only override them. `load_config` / `config_from_dict` reject unknown keys and wrongly typed values (e.g. `width: "11"`), so a misspelled parameter fails loudly instead of silently using a default. `config_to_dict` returns a YAML-serializable copy for logging the exact configuration of a run.
 
 ---
 
@@ -151,17 +173,22 @@ No diagonal movement.
 
 ## 6. Observation Model
 
-**Implemented mode:** `ObservationMode.GLOBAL` only.
+Two modes are implemented.
 
-`env.observe()` / `build_observation(state, mode=GLOBAL)` returns `GlobalObservation`:
+**`ObservationMode.GLOBAL`** returns `GlobalObservation`:
 
 - Grid: `width`, `height`, `traversable` (height×width bool matrix), `obstacles`
 - `red_base`, `blue_base`
 - Full `agents` and `flags` maps
-- `timestep`, `winner`, `terminated`, `truncation`, `tagging_enabled`
+- `timestep`, `winner`, `terminated`, `truncation`, `tagging_enabled`, `visibility_radius`
 - `to_dict()` for serialization
 
-Additional modes can be added in `observations.py` later. Partial observability is **not** implemented.
+**`ObservationMode.PARTIAL`** (requires `team=`) returns `PartialTeamObservation`, the team-level fog-of-war view:
+
+- Friendly agents (including eliminated ones) are always fully visible.
+- An enemy agent is visible only if it is active and within `visibility_radius` (Manhattan) of an **active** friendly agent. Eliminated agents see nothing.
+- The enemy flag is visible under the same rule; the team's own flag is always visible.
+- Because the view is the union over all active teammates, whatever one agent (e.g. a scout) sees, the whole team sees.
 
 ---
 
@@ -244,9 +271,9 @@ Co-location of non-carriers is allowed throughout; only tagging special-cases ca
 
 - **Loading:** `load_config("configs/default.yaml")` or construct `CTFConfig(...)` in code.
 - **Validation:** On construction, `CTFConfig` checks grid dimensions, episode length, agent count, base/spawn bounds, bases/spawns not on obstacles, explicit spawn counts, and feasibility of auto-generated spawns.
-- **Seed:** `CTFConfig.seed` and `reset(seed=…)` reinitialize the environment’s private `random.Random` instance.
-- **Determinism:** With identical configuration and action sequence, transitions are deterministic. **Prototype 1 `step()` does not consume RNG state**; gameplay is fully driven by config and actions.
-- The RNG is reserved for possible future procedural setup (maps/spawns), using the environment-local generator rather than the global `random` module.
+- **Seed:** the environment owns a private `random.Random`, created from `CTFConfig.seed`. `reset(seed=…)` reseeds it; `reset()` without a seed *continues* the stream, so consecutive episodes differ (when `spawn_mode` is random) while the whole sequence stays reproducible from `config.seed`.
+- **Determinism:** `step()` never consumes RNG state. Given the same spawns and actions, transitions are identical. With `spawn_mode: fixed` (the default) every episode starts identically, so repeated matches between deterministic strategies are identical too; use `shuffle` or `near_base` to get varied, seeded episodes.
+- The RNG is environment-local; the global `random` module is never used.
 
 ---
 
@@ -256,9 +283,9 @@ Main class: `CTFEnvironment(config: CTFConfig)`.
 
 | Member | Behavior |
 |--------|----------|
-| `reset(*, seed=None)` | New episode; returns **snapshot** `GameState`. Reseeds internal RNG. |
+| `reset(*, seed=None)` | New episode; returns **snapshot** `GameState`. Samples spawns from the internal RNG; `seed` reseeds it first. |
 | `step(actions)` | One transition; returns `(state, rewards, done, info)`. `state` is a snapshot. Raises if not reset or already terminated. |
-| `observe(mode=ObservationMode.GLOBAL)` | Builds `GlobalObservation` from internal state. |
+| `observe(mode=GLOBAL, *, team=None, visibility_radius=None)` | Builds a `GlobalObservation`, or a `PartialTeamObservation` for `mode=PARTIAL` (needs `team`). Radius defaults to `config.visibility_radius`. |
 | `state` | **Snapshot** copy of current state (mutating it does not affect the simulator). |
 | `done` | `True` when internal `terminated` is set. |
 | `config` | The `CTFConfig` instance. |
@@ -339,7 +366,6 @@ Control loop: `observation → strategy → actions → environment → next sta
 - Reinforcement learning or MARL training loops
 - Built-in opponent AI
 - A*, Minimax, MCTS, or other planners inside the env
-- Partial observability (only GLOBAL observations exist)
 - Networking or multiplayer
 - Sophisticated combat beyond tagging
 - Dropped flags, respawn, or extra game modes
@@ -354,7 +380,7 @@ Documented verification status (implementation / QA, not research results):
 
 | Check | Status |
 |-------|--------|
-| Automated tests | **30** tests (`uv run pytest`) |
+| Automated tests | `uv run pytest` (all passing) |
 | Deterministic text demo | `scripts/run_demo.py` — RED wins, `reason=flag_capture` |
 | Flag pickup and return | Covered by tests and end-to-end demo |
 | Episode termination | Win and max-step truncation tested |

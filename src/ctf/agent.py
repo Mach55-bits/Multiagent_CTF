@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -21,31 +21,10 @@ class Agent:
     carrying_flag: bool = False
 
     def with_position(self, x: int, y: int) -> "Agent":
-        return Agent(
-            agent_id=self.agent_id,
-            team=self.team,
-            x=x,
-            y=y,
-            active=self.active,
-            carrying_flag=self.carrying_flag,
-        )
+        return replace(self, x=x, y=y)
 
     def with_active(self, active: bool) -> "Agent":
-        return Agent(
-            agent_id=self.agent_id,
-            team=self.team,
-            x=self.x,
-            y=self.y,
-            active=active,
-            carrying_flag=self.carrying_flag,
-        )
+        return replace(self, active=active)
 
     def with_carrying_flag(self, carrying: bool) -> "Agent":
-        return Agent(
-            agent_id=self.agent_id,
-            team=self.team,
-            x=self.x,
-            y=self.y,
-            active=self.active,
-            carrying_flag=carrying,
-        )
+        return replace(self, carrying_flag=carrying)

@@ -1,0 +1,47 @@
+# ---- Python ----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments (uv.lock is NOT ignored: commit it for reproducibility)
+.venv/
+venv/
+env/
+
+# Packaging / build
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Test, type-check and lint caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# ---- Experiment outputs (RL training, evaluation, recordings) ---------------
+runs/
+checkpoints/
+outputs/
+wandb/
+lightning_logs/
+*.pt
+*.pth
+events.out.tfevents.*
+
+# ---- Secrets ----------------------------------------------------------------
+.env
+*.key
+
+# ---- OS / editor ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

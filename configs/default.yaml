@@ -1,10 +1,32 @@
+# Default environment configuration.
+# Every key is listed explicitly; omitted keys fall back to the defaults declared
+# in src/ctf/config.py. Unknown keys are rejected on load.
+
+# --- grid and rules -----------------------------------------------------------
 width: 11
 height: 7
 agents_per_team: 3
 tagging_enabled: true
 max_episode_steps: 200
+
+# --- reproducibility ----------------------------------------------------------
+# Seeds the environment's private RNG at construction. env.reset(seed=...) reseeds it.
+# Only matters when spawn_mode is not "fixed"; step() itself is always deterministic.
 seed: 42
 
+# --- partial observability ----------------------------------------------------
+# Manhattan radius within which a team sees enemies / the enemy flag.
+visibility_radius: 3
+
+# --- spawning -----------------------------------------------------------------
+# fixed      use red_spawns / blue_spawns below (or the cells nearest the base)
+# shuffle    same cells, randomly re-assigned among the team's agents each episode
+# near_base  random distinct home-zone cells within spawn_radius of the base
+spawn_mode: fixed
+spawn_radius: 3          # used by near_base
+spawn_allow_base: true   # near_base: may an agent start on its own flag cell?
+
+# --- map ----------------------------------------------------------------------
 red_base: [1, 3]
 blue_base: [9, 3]
 

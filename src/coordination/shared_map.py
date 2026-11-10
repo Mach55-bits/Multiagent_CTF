@@ -139,8 +139,8 @@ def update_shared_map_from_partial_team(
     team_map: SharedTeamMap,
     observation: PartialTeamObservation,
 ) -> None:
-    """Merge each friendly agent's partial view into the team shared map."""
+    """Merge each active friendly agent's partial view into the team shared map."""
     for agent_id, agent in observation.agents.items():
-        if agent.team is not observation.team:
+        if agent.team is not observation.team or not agent.active:
             continue
         team_map.update_from_scout(build_scout_view_from_partial(observation, agent_id))

@@ -1,0 +1,123 @@
+# MAPPO training configuration. EVERY key is required: nothing is defaulted in code.
+# Override from the command line with  --set ppo.learning_rate=1e-4  (dotted paths).
+
+run:
+  name: mappo_default
+  output_dir: runs                 # run files go to <output_dir>/<name>/
+  seed: 0
+  device: cpu                      # cpu | cuda | mps | auto  (cpu is fastest for this tiny net)
+  torch_threads: 2
+  checkpoint_every_steps: 500000
+  log_every_updates: 1
+
+env:
+  config_path: configs/default.yaml  # base environment; phases override parts of it below
+
+roles:
+  slots: [attacker, defender, scout]  # role of agents 1,2,3 of a team (sorted ids)
+
+features:
+  mirror_blue: true                # BLUE sees the board flipped, so one policy plays both sides
+  staleness_horizon: 50            # steps until a seen cell counts as fully stale
+
+rewards:
+  win: 10.0
+  loss: -10.0
+  timeout: -1.0
+  pickup: 2.0
+  tagged_while_carrying: -2.0
+  tag_enemy_carrier: 2.0
+  tag_team_share: 0.5              # each teammate of the tagger also gets this
+  attacker_potential: 0.05         # per cell of path distance gained toward the objective
+  defender_potential: 0.02
+  scout_new_cell: 0.05             # per newly seen cell (scout role only)
+  scout_anneal_steps: 3000000      # scout bonus fades linearly to 0 over this many steps
+  step_penalty: -0.002
+
+model:
+  conv_channels: [32, 32, 16]
+  kernel_size: 3
+  hidden_size: 256
+
+ppo:
+  learning_rate: 0.0003
+  learning_rate_final: 0.00003     # linear decay over total_steps
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_coef: 0.01
+  entropy_coef_final: 0.003        # linear decay over total_steps
+  value_coef: 0.5
+  max_grad_norm: 0.5
+  epochs: 4
+  num_minibatches: 4
+  adam_eps: 0.00001
+  normalize_advantages: true
+  value_normalization: true        # running mean/std of returns (MAPPO "ValueNorm")
+
+rollout:
+  num_envs: 16
+  num_workers: 4                   # worker processes; set to (CPU cores - 1), at most num_envs
+  rollout_length: 128
+  total_steps: 20000000            # environment steps (one step = both teams moving once)
+
+curriculum:
+  learner_side: random             # red | blue | random, drawn per episode
+  # A phase ends when the rolling win rate over `window_episodes` reaches
+  # `advance_win_rate`, or after `max_steps`. The last phase runs to the end.
+  phases:
+    - name: learn_the_task
+      max_steps: 2000000
+      advance_win_rate: 0.7
+      window_episodes: 200
+      fixed_spawn_fraction: 0.0
+      opponent_noise: 0.0
+      env_overrides:
+        visibility_radius: 20      # larger than the map = full view
+        spawn_mode: near_base
+        spawn_allow_base: false
+      opponents:
+        - {kind: stay, weight: 1.0, params: {}}
+        - {kind: random, weight: 1.0, params: {}}
+
+    - name: handle_defenders
+      max_steps: 4000000
+      advance_win_rate: 0.7
+      window_episodes: 200
+      fixed_spawn_fraction: 0.3
+      opponent_noise: 0.05
+      env_overrides:
+        visibility_radius: 6
+        spawn_mode: near_base
+        spawn_allow_base: true
+      opponents:
+        - kind: scripted
+          weight: 2.0
+          params: {roles: [attacker, defender, scout], guard_mode: leash, guard_leash: 2, scout_behavior: random}
+        - kind: scripted
+          weight: 1.0
+          params: {roles: [attacker, defender, scout], guard_mode: on_flag, guard_leash: 0, scout_behavior: stay}
+        - {kind: random, weight: 1.0, params: {}}
+
+    - name: real_setting
+      max_steps: 14000000
+      advance_win_rate: 1.0        # last phase: runs until rollout.total_steps
+      window_episodes: 200
+      fixed_spawn_fraction: 0.5
+      opponent_noise: 0.05
+      env_overrides:
+        visibility_radius: 3
+        spawn_mode: near_base
+        spawn_allow_base: true
+      opponents:
+        - kind: scripted
+          weight: 2.0
+          params: {roles: [attacker, defender, scout], guard_mode: leash, guard_leash: 2, scout_behavior: random}
+        - kind: scripted
+          weight: 1.0
+          params: {roles: [attacker, defender, scout], guard_mode: on_flag, guard_leash: 0, scout_behavior: stay}
+        - kind: scripted
+          weight: 1.0
+          params: {roles: [attacker, attacker, defender], guard_mode: leash, guard_leash: 3, scout_behavior: stay}
+        - {kind: random, weight: 0.5, params: {}}
+        - {kind: stay, weight: 0.5, params: {}}

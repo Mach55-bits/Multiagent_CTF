@@ -35,6 +35,12 @@ uv run python visualization/demo.py
 
 SPACE = pause/resume, ESC = quit, R = restart.
 
+## RL agent (work in progress)
+
+`src/rl/` holds the MAPPO agent (CNN actor-critic, role-conditioned heads, centralized critic).
+Everything tunable lives in `configs/rl/default.yaml` (every key is required; override from the
+command line with dotted paths). The RL tests need the extras: `uv sync --extra dev --extra rl`.
+
 ## Configuration
 
 All parameters have a single default in `src/ctf/config.py`; YAML files override them and are validated strictly (unknown keys and wrong types are errors). See `configs/default.yaml` for every option with comments.

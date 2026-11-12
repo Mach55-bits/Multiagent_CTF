@@ -29,6 +29,7 @@ COMPONENTS = (
     "potential",
     "scout",
     "step",
+    "carry",
 )
 
 
@@ -88,7 +89,7 @@ class RewardCalculator:
             if role is Role.ATTACKER:
                 if agent.carrying_flag:
                     d_home = self.nav.distance(here, self.own_base)
-                    phi[slot] = self.cfg.attacker_potential * (self._carry_offset - d_home)
+                    phi[slot] = self.cfg.attacker_carry_potential * (self._carry_offset - d_home)
                 else:
                     target = (enemy_flag.x, enemy_flag.y)
                     phi[slot] = -self.cfg.attacker_potential * self.nav.distance(here, target)
@@ -166,8 +167,11 @@ class RewardCalculator:
         for slot in range(n):
             if self.roles[slot] is Role.SCOUT:
                 comp["scout"][slot] = cfg.scout_new_cell * scout_scale * fresh[slot]
-            if prev_agents[self.agent_ids[slot]].active:
+            before = prev_agents[self.agent_ids[slot]]
+            if before.active:
                 comp["step"][slot] = cfg.step_penalty
+                if before.carrying_flag:
+                    comp["carry"][slot] = cfg.carry_step_penalty
 
         total = sum(comp.values())
         return RewardResult(total=np.asarray(total, dtype=np.float64), components=comp)

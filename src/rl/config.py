@@ -32,7 +32,9 @@ class RunConfig:
     device: str  # "cpu", "cuda", "mps" or "auto"
     torch_threads: int
     checkpoint_every_steps: int
+    keep_checkpoints: int  # periodic checkpoints to keep (0 = keep all); phase snapshots are never pruned
     log_every_updates: int
+    tensorboard: bool
 
 
 @dataclass(frozen=True)
@@ -60,7 +62,9 @@ class RewardsConfig:
     tagged_while_carrying: float
     tag_enemy_carrier: float
     tag_team_share: float
-    attacker_potential: float  # reward per cell of path distance saved
+    attacker_potential: float  # reward per cell of path distance saved while heading for the flag
+    attacker_carry_potential: float  # same, while carrying the flag home
+    carry_step_penalty: float  # per step while carrying the flag (makes idling with it costly)
     defender_potential: float
     scout_new_cell: float
     scout_anneal_steps: int  # scout bonus decays linearly to 0 over this many steps
@@ -154,7 +158,8 @@ def _validate(cfg: RLConfig) -> None:
     _check(p.epochs >= 1 and p.num_minibatches >= 1, "ppo.epochs/num_minibatches must be >= 1")
     _check(p.learning_rate > 0 and p.learning_rate_final >= 0, "learning rates must be positive")
     _check(r.num_envs >= 1 and r.rollout_length >= 1 and r.total_steps >= 1, "rollout sizes must be >= 1")
-    _check(1 <= r.num_workers <= r.num_envs, "rollout.num_workers must be in [1, num_envs]")
+    _check(0 <= r.num_workers <= r.num_envs, "rollout.num_workers must be in [0, num_envs] (0 = run in the main process)")
+    _check(cfg.run.keep_checkpoints >= 0 and cfg.run.checkpoint_every_steps >= 1, "run.keep_checkpoints must be >= 0 and run.checkpoint_every_steps >= 1")
     _check(len(cfg.model.conv_channels) >= 1, "model.conv_channels needs at least one layer")
     _check(cfg.model.kernel_size % 2 == 1, "model.kernel_size must be odd")
     _check(cfg.features.staleness_horizon >= 1, "features.staleness_horizon must be >= 1")

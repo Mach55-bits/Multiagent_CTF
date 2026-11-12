@@ -44,7 +44,7 @@ def _advance(env, calc, prev, red_actions, blue_actions=None, scout_scale=1.0):
 
 
 def test_potential_shaping_telescopes_when_undiscounted() -> None:
-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1))
+    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1))
     total = 0.0
     # R1 starts at (3,1); BLUE flag is at (4,1): one step right = pickup
     glob2, res, _ = _advance(env, calc, glob.agents, {"R1": Action.RIGHT})
@@ -54,7 +54,7 @@ def test_potential_shaping_telescopes_when_undiscounted() -> None:
 
 
 def test_potential_is_continuous_across_pickup_and_rewards_carrying_home() -> None:
-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1))
+    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1))
     prev = glob.agents
     total = 0.0
     for action in [Action.RIGHT, Action.LEFT, Action.LEFT, Action.LEFT, Action.LEFT]:
@@ -69,7 +69,7 @@ def test_potential_is_continuous_across_pickup_and_rewards_carrying_home() -> No
 
 def test_discounted_shaping_matches_formula() -> None:
     gamma = 0.9
-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1), gamma=gamma)
+    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1), gamma=gamma)
     phi0 = -0.1 * 1
     _, res, _ = _advance(env, calc, glob.agents, {"R1": Action.RIGHT})
     assert res.components["potential"][0] == pytest.approx(gamma * 0.0 - phi0)
@@ -144,3 +144,25 @@ def test_step_penalty_applies_to_active_agents_only() -> None:
     glob, res, _ = _advance(env, calc, glob.agents, {})
     assert res.components["step"].tolist() == [0.0, -0.1, -0.1]
     assert isinstance(res.total, np.ndarray) and res.total.shape == (3,)
+
+
+def test_carry_potential_has_its_own_weight_and_total_shaping_is_weight_independent() -> None:
+    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.3))
+    prev, per_step = glob.agents, []
+    for action in [Action.RIGHT, Action.LEFT, Action.LEFT, Action.LEFT, Action.LEFT]:
+        glob, res, _ = _advance(env, calc, prev, {"R1": action})
+        prev = glob.agents
+        per_step.append(res.components["potential"][0])
+    assert per_step[1] == pytest.approx(0.3) and per_step[2] == pytest.approx(0.3)  # carrying: 0.3 per cell
+    assert per_step[0] == pytest.approx(0.1)  # approach/pickup step: 0.1
+    assert sum(per_step) == pytest.approx(0.1)  # telescopes (terminal potential 0), whatever the weights
+
+
+def test_carry_step_penalty_applies_only_while_carrying() -> None:
+    env, calc, glob = _setup(_zero_rewards(carry_step_penalty=-0.5))
+    prev = glob.agents
+    glob, res, _ = _advance(env, calc, prev, {"R1": Action.RIGHT})  # picks up the flag this step
+    assert res.components["carry"].tolist() == [0.0, 0.0, 0.0]  # not carrying at the start of the step
+    prev = glob.agents
+    glob, res, _ = _advance(env, calc, prev, {"R1": Action.LEFT})
+    assert res.components["carry"].tolist() == [-0.5, 0.0, 0.0]

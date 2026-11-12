@@ -38,8 +38,26 @@ SPACE = pause/resume, ESC = quit, R = restart.
 ## RL agent (work in progress)
 
 `src/rl/` holds the MAPPO agent (CNN actor-critic, role-conditioned heads, centralized critic).
-Everything tunable lives in `configs/rl/default.yaml` (every key is required; override from the
-command line with dotted paths). The RL tests need the extras: `uv sync --extra dev --extra rl`.
+Everything tunable lives in `configs/rl/default.yaml`; every key is required and unknown keys are
+errors. Override any value from the command line with a dotted path.
+
+```bash
+uv sync --extra dev --extra rl                      # install (adds torch, tensorboard, matplotlib)
+uv run pytest -q                                    # run all tests
+
+# 1. pick rollout.num_workers / torch_threads / model size for your machine
+uv run python -m rl.benchmark --workers 0 2 3 --updates 2
+
+# 2. train (a run lives in runs/<run.name>/: metrics.jsonl, config.yaml, checkpoints/, tensorboard/)
+uv run python -m rl.train --set run.name=first_run --set rollout.num_workers=3
+uv run python -m rl.train --set run.name=first_run --set rollout.num_workers=3 --resume latest
+uv run python -m rl.train --print-config            # show the resolved configuration
+
+# 3. watch learning curves
+uv run tensorboard --logdir runs
+```
+
+Ctrl+C saves a checkpoint before exiting, so a run can always be continued with `--resume latest`.
 
 ## Configuration
 

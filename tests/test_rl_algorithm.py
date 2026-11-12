@@ -178,3 +178,16 @@ def test_eliminated_agents_get_no_policy_gradient_but_train_the_critic() -> None
     assert stats["policy_loss"] == 0.0 and stats["entropy"] == 0.0
     assert all(torch.equal(a, b) for a, b in zip(before_actor, model.actor_encoder.parameters()))
     assert any(not torch.equal(a, b) for a, b in zip(before_critic, model.critic_encoder.parameters()))
+
+
+def test_benchmark_reports_positive_timings(tmp_path) -> None:
+    from rl.benchmark import measure
+    from rl_helpers import DEFAULT_RL_YAML
+
+    overrides = {
+        "model.conv_channels": [4], "model.hidden_size": 16, "rollout.num_envs": 2,
+        "rollout.rollout_length": 4, "rollout.num_workers": 0, "run.torch_threads": 1,
+        "env.config_path": str(ROOT / "configs" / "default.yaml"),
+    }
+    result = measure(str(DEFAULT_RL_YAML), overrides, workers=0, updates=1)
+    assert result["rollout_s"] > 0 and result["update_s"] > 0 and result["steps_per_sec"] > 0

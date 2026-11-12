@@ -33,3 +33,32 @@ def small_env_config(**overrides) -> CTFConfig:
     )
     base.update(overrides)
     return CTFConfig(**base)
+
+
+def tiny_config(
+    output_dir: str,
+    *,
+    num_envs: int = 2,
+    num_workers: int = 0,
+    rollout_length: int = 8,
+    total_steps: int = 48,
+    phases: int = 1,
+    checkpoint_every_steps: int = 16,
+    first_phase_max_steps: int | None = None,
+) -> RLConfig:
+    """A fast config for trainer tests: tiny network, few envs, a handful of updates."""
+    cfg = rl_config()
+    all_phases = cfg.curriculum.phases
+    chosen = all_phases[1:2] if phases == 1 else all_phases[:phases]
+    if first_phase_max_steps is not None:
+        chosen = [replace(chosen[0], max_steps=first_phase_max_steps), *chosen[1:]]
+    return replace(
+        cfg,
+        run=replace(cfg.run, output_dir=output_dir, name="t", tensorboard=False,
+                    checkpoint_every_steps=checkpoint_every_steps, keep_checkpoints=2),
+        env=replace(cfg.env, config_path=str(ROOT / "configs" / "default.yaml")),
+        model=replace(cfg.model, conv_channels=[4], hidden_size=16),
+        rollout=replace(cfg.rollout, num_envs=num_envs, num_workers=num_workers,
+                        rollout_length=rollout_length, total_steps=total_steps),
+        curriculum=replace(cfg.curriculum, phases=chosen),
+    )

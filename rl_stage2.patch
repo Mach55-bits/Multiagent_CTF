@@ -1,0 +1,1712 @@
+diff --git a/README.md b/README.md
+index 9d98dec..b30e3e9 100644
+--- a/README.md
++++ b/README.md
+@@ -38,8 +38,26 @@ SPACE = pause/resume, ESC = quit, R = restart.
+ ## RL agent (work in progress)
+ 
+ `src/rl/` holds the MAPPO agent (CNN actor-critic, role-conditioned heads, centralized critic).
+-Everything tunable lives in `configs/rl/default.yaml` (every key is required; override from the
+-command line with dotted paths). The RL tests need the extras: `uv sync --extra dev --extra rl`.
++Everything tunable lives in `configs/rl/default.yaml`; every key is required and unknown keys are
++errors. Override any value from the command line with a dotted path.
++
++```bash
++uv sync --extra dev --extra rl                      # install (adds torch, tensorboard, matplotlib)
++uv run pytest -q                                    # run all tests
++
++# 1. pick rollout.num_workers / torch_threads / model size for your machine
++uv run python -m rl.benchmark --workers 0 2 3 --updates 2
++
++# 2. train (a run lives in runs/<run.name>/: metrics.jsonl, config.yaml, checkpoints/, tensorboard/)
++uv run python -m rl.train --set run.name=first_run --set rollout.num_workers=3
++uv run python -m rl.train --set run.name=first_run --set rollout.num_workers=3 --resume latest
++uv run python -m rl.train --print-config            # show the resolved configuration
++
++# 3. watch learning curves
++uv run tensorboard --logdir runs
++```
++
++Ctrl+C saves a checkpoint before exiting, so a run can always be continued with `--resume latest`.
+ 
+ ## Configuration
+ 
+diff --git a/configs/rl/default.yaml b/configs/rl/default.yaml
+index f9dc99c..9ecad4d 100644
+--- a/configs/rl/default.yaml
++++ b/configs/rl/default.yaml
+@@ -8,7 +8,9 @@ run:
+   device: cpu                      # cpu | cuda | mps | auto  (cpu is fastest for this tiny net)
+   torch_threads: 2
+   checkpoint_every_steps: 500000
++  keep_checkpoints: 5              # newest periodic checkpoints kept (0 = keep all)
+   log_every_updates: 1
++  tensorboard: true                # also write TensorBoard event files
+ 
+ env:
+   config_path: configs/default.yaml  # base environment; phases override parts of it below
+@@ -28,16 +30,18 @@ rewards:
+   tagged_while_carrying: -2.0
+   tag_enemy_carrier: 2.0
+   tag_team_share: 0.5              # each teammate of the tagger also gets this
+-  attacker_potential: 0.05         # per cell of path distance gained toward the objective
++  attacker_potential: 0.05         # per cell of path distance gained toward the enemy flag
++  attacker_carry_potential: 0.2    # per cell gained while carrying the flag home (denser: this is the hard part)
++  carry_step_penalty: -0.02        # per step while carrying; stops 'grab the flag, then freeze'
+   defender_potential: 0.02
+   scout_new_cell: 0.05             # per newly seen cell (scout role only)
+   scout_anneal_steps: 3000000      # scout bonus fades linearly to 0 over this many steps
+   step_penalty: -0.002
+ 
+ model:
+-  conv_channels: [32, 32, 16]
++  conv_channels: [16, 16]          # PPO update cost scales with this: [32,32,16]/256 is ~2.7x slower
+   kernel_size: 3
+-  hidden_size: 256
++  hidden_size: 128
+ 
+ ppo:
+   learning_rate: 0.0003
+@@ -57,31 +61,35 @@ ppo:
+ 
+ rollout:
+   num_envs: 16
+-  num_workers: 4                   # worker processes; set to (CPU cores - 1), at most num_envs
++  num_workers: 4                   # worker processes, at most num_envs; 0 = run in the main process (debugging)
+   rollout_length: 128
+-  total_steps: 20000000            # environment steps (one step = both teams moving once)
++  total_steps: 10000000            # environment steps (one step = both teams moving once)
+ 
+ curriculum:
+   learner_side: random             # red | blue | random, drawn per episode
+   # A phase ends when the rolling win rate over `window_episodes` reaches
+   # `advance_win_rate`, or after `max_steps`. The last phase runs to the end.
+   phases:
++    # Phase 1 teaches the whole task (grab the flag, run home, capture) with the opponents
++    # starting in the far corners, away from their flag. Starting next to a guarded flag made
++    # the agent learn "grab the flag, then freeze" (measured), so defenders arrive in phase 2.
+     - name: learn_the_task
+-      max_steps: 2000000
++      max_steps: 1500000
+       advance_win_rate: 0.7
+       window_episodes: 200
+       fixed_spawn_fraction: 0.0
+       opponent_noise: 0.0
+       env_overrides:
+         visibility_radius: 20      # larger than the map = full view
+-        spawn_mode: near_base
+-        spawn_allow_base: false
++        spawn_mode: shuffle        # same cells, random assignment (corners are mirror-symmetric)
++        red_spawns: [[0, 0], [0, 6], [2, 0]]
++        blue_spawns: [[10, 0], [10, 6], [8, 0]]
+       opponents:
+         - {kind: stay, weight: 1.0, params: {}}
+         - {kind: random, weight: 1.0, params: {}}
+ 
+     - name: handle_defenders
+-      max_steps: 4000000
++      max_steps: 3000000
+       advance_win_rate: 0.7
+       window_episodes: 200
+       fixed_spawn_fraction: 0.3
+@@ -100,7 +108,7 @@ curriculum:
+         - {kind: random, weight: 1.0, params: {}}
+ 
+     - name: real_setting
+-      max_steps: 14000000
++      max_steps: 5500000
+       advance_win_rate: 1.0        # last phase: runs until rollout.total_steps
+       window_episodes: 200
+       fixed_spawn_fraction: 0.5
+diff --git a/src/rl/benchmark.py b/src/rl/benchmark.py
+new file mode 100644
+index 0000000..e1783b7
+--- /dev/null
++++ b/src/rl/benchmark.py
+@@ -0,0 +1,85 @@
++"""Measure training throughput (rollout + PPO update) to choose ``rollout.num_workers``,
++``run.torch_threads`` and the model size.
++
++    python -m rl.benchmark --workers 0 1 2 4 --updates 3
++"""
++
++from __future__ import annotations
++
++import argparse
++import time
++from pathlib import Path
++
++import torch
++
++from rl.buffer import RolloutBuffer
++from rl.config import load_base_env_config, load_rl_config
++from rl.mappo import MAPPO, ValueNorm
++from rl.networks import ActorCritic, NetworkSpec
++from rl.rollout import collect
++from rl.schema import parse_override
++from rl.trainer import resolve_device
++from rl.vec_env import make_vec_env
++
++
++def measure(config_path: str, overrides: dict, workers: int, updates: int) -> dict[str, float]:
++    """Time ``updates`` full training iterations; returns per-phase seconds and overall steps/s."""
++    cfg = load_rl_config(config_path, {**overrides, "rollout.num_workers": workers})
++    env_config = load_base_env_config(cfg, root=Path.cwd())
++    device = resolve_device(cfg.run.device)
++    torch.set_num_threads(cfg.run.torch_threads)
++    spec = NetworkSpec.from_env(env_config)
++    model = ActorCritic(spec, cfg.model).to(device)
++    value_norm = ValueNorm(cfg.ppo.value_normalization).to(device)
++    algo = MAPPO(model, cfg.ppo, value_norm)
++    buffer = RolloutBuffer(cfg.rollout.rollout_length, cfg.rollout.num_envs, env_config.agents_per_team, spec)
++    vec = make_vec_env(cfg, env_config, cfg.run.seed)
++    rollout_time = update_time = 0.0
++
++    def iteration() -> tuple[float, float]:
++        nonlocal obs
++        t0 = time.time()
++        obs, _ = collect(vec, obs, model, value_norm, buffer, device)
++        t1 = time.time()
++        buffer.compute_gae(cfg.ppo.gamma, cfg.ppo.gae_lambda)
++        model.train()
++        algo.update(buffer.to_batch(device), cfg.ppo.learning_rate, cfg.ppo.entropy_coef)
++        return t1 - t0, time.time() - t1
++
++    try:
++        vec.set_phase(len(cfg.curriculum.phases) - 1)  # the real (slowest) setting
++        obs = vec.reset()
++        iteration()  # warm-up
++        for _ in range(updates):
++            r, u = iteration()
++            rollout_time += r
++            update_time += u
++    finally:
++        vec.close()
++    steps = cfg.rollout.rollout_length * cfg.rollout.num_envs
++    return {
++        "rollout_s": rollout_time / updates,
++        "update_s": update_time / updates,
++        "steps_per_sec": steps * updates / (rollout_time + update_time),
++        "total_steps": float(cfg.rollout.total_steps),
++    }
++
++
++def main(argv: list[str] | None = None) -> int:
++    p = argparse.ArgumentParser(description="Rollout throughput benchmark (no learning).")
++    p.add_argument("--config", default="configs/rl/default.yaml")
++    p.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=VALUE")
++    p.add_argument("--workers", type=int, nargs="+", default=[0, 1, 2, 4])
++    p.add_argument("--updates", type=int, default=3, help="rollouts to time per setting")
++    args = p.parse_args(argv)
++    overrides = dict(parse_override(t) for t in args.overrides)
++    print("workers | rollout s/upd | PPO update s/upd | steps/s | est. hours for run.total_steps")
++    for w in args.workers:
++        r = measure(args.config, overrides, w, args.updates)
++        hours = r["total_steps"] / r["steps_per_sec"] / 3600
++        print(f"{w:7d} | {r['rollout_s']:13.2f} | {r['update_s']:16.2f} | {r['steps_per_sec']:7.0f} | {hours:8.1f}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/rl/checkpoint.py b/src/rl/checkpoint.py
+new file mode 100644
+index 0000000..e1e7094
+--- /dev/null
++++ b/src/rl/checkpoint.py
+@@ -0,0 +1,184 @@
++"""Checkpoint saving/loading.
++
++A checkpoint is self-contained: weights, optimizer, value normalizer, curriculum
++state, counters, the resolved configs, the git commit, and a record of the
++observation layout. Loading refuses a checkpoint whose observation layout does not
++match the current code, instead of silently feeding the network scrambled inputs.
++"""
++
++from __future__ import annotations
++
++import os
++import shutil
++import subprocess
++from pathlib import Path
++from typing import Any
++
++import torch
++
++from ctf.config import CTFConfig, config_from_dict, config_to_dict
++from rl.canonical import ACTIONS
++from rl.config import RLConfig, config_to_plain
++from rl.curriculum import Curriculum
++from rl.features import (
++    ACTOR_CHANNELS,
++    ACTOR_VECTOR,
++    CRITIC_CHANNELS,
++    CRITIC_VECTOR,
++    ROLE_ORDER,
++)
++from rl.mappo import ValueNorm
++from rl.networks import ActorCritic, NetworkSpec
++from rl.schema import from_dict
++
++FORMAT_VERSION = 1
++
++
++class CheckpointError(RuntimeError):
++    pass
++
++
++def observation_spec() -> dict[str, list[str]]:
++    return {
++        "actor_channels": list(ACTOR_CHANNELS),
++        "actor_vector": list(ACTOR_VECTOR),
++        "critic_channels": list(CRITIC_CHANNELS),
++        "critic_vector": list(CRITIC_VECTOR),
++        "roles": [r.value for r in ROLE_ORDER],
++        "actions": [a.name for a in ACTIONS],
++    }
++
++
++def git_commit() -> str:
++    try:
++        root = Path(__file__).resolve().parents[2]
++        out = subprocess.run(
++            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, timeout=5, check=True
++        )
++        return out.stdout.strip()
++    except (OSError, subprocess.SubprocessError):
++        return "unknown"
++
++
++def save_checkpoint(
++    path: Path,
++    *,
++    model: ActorCritic,
++    optimizer: torch.optim.Optimizer,
++    value_norm: ValueNorm,
++    curriculum: Curriculum,
++    counters: dict[str, int],
++    config: RLConfig,
++    env_config: CTFConfig,
++) -> None:
++    payload = {
++        "format_version": FORMAT_VERSION,
++        "model": model.state_dict(),
++        "optimizer": optimizer.state_dict(),
++        "value_norm": value_norm.state_dict(),
++        "curriculum": curriculum.state_dict(),
++        "counters": dict(counters),
++        "torch_rng": torch.get_rng_state(),
++        "config": config_to_plain(config),
++        "env_config": config_to_dict(env_config),
++        "obs_spec": observation_spec(),
++        "git_commit": git_commit(),
++    }
++    path.parent.mkdir(parents=True, exist_ok=True)
++    tmp = path.with_suffix(path.suffix + ".tmp")
++    torch.save(payload, tmp)
++    os.replace(tmp, path)  # atomic: a crash never leaves a half-written checkpoint
++
++
++def load_checkpoint(path: str | Path, map_location: str | torch.device = "cpu") -> dict[str, Any]:
++    path = Path(path)
++    if not path.exists():
++        raise CheckpointError(f"checkpoint not found: {path}")
++    payload = torch.load(path, map_location=map_location, weights_only=True)
++    if payload.get("format_version") != FORMAT_VERSION:
++        raise CheckpointError(
++            f"{path}: unsupported checkpoint format {payload.get('format_version')!r} "
++            f"(this code reads format {FORMAT_VERSION})"
++        )
++    saved, current = payload["obs_spec"], observation_spec()
++    if saved != current:
++        diff = sorted(k for k in current if saved.get(k) != current[k])
++        raise CheckpointError(
++            f"{path}: observation layout differs from the current code in {diff}; "
++            "this checkpoint was trained with a different feature set"
++        )
++    return payload
++
++
++def restore_training_state(
++    payload: dict[str, Any],
++    *,
++    model: ActorCritic,
++    optimizer: torch.optim.Optimizer,
++    value_norm: ValueNorm,
++    curriculum: Curriculum,
++) -> dict[str, int]:
++    try:
++        model.load_state_dict(payload["model"])
++    except RuntimeError as exc:
++        raise CheckpointError(
++            "checkpoint weights do not fit the configured model (did model.* change?)"
++        ) from exc
++    optimizer.load_state_dict(payload["optimizer"])
++    value_norm.load_state_dict(payload["value_norm"])
++    curriculum.load_state_dict(payload["curriculum"])
++    torch.set_rng_state(payload["torch_rng"].cpu())
++    return {k: int(v) for k, v in payload["counters"].items()}
++
++
++def load_policy(
++    path: str | Path, device: str | torch.device = "cpu"
++) -> tuple[ActorCritic, dict[str, Any]]:
++    """Rebuild the trained network for inference (no training state needed)."""
++    payload = load_checkpoint(path, map_location="cpu")
++    config = from_dict(RLConfig, payload["config"])
++    env_config = config_from_dict(payload["env_config"])
++    model = ActorCritic(NetworkSpec.from_env(env_config), config.model)
++    model.load_state_dict(payload["model"])
++    model.to(device).eval()
++    meta = {
++        "config": config,
++        "env_config": env_config,
++        "counters": payload["counters"],
++        "git_commit": payload["git_commit"],
++        "value_norm": payload["value_norm"],
++    }
++    return model, meta
++
++
++class CheckpointManager:
++    """Writes periodic checkpoints (pruned), a ``latest.pt`` copy, and permanent phase snapshots."""
++
++    def __init__(self, run_dir: Path, keep: int) -> None:
++        self.dir = run_dir / "checkpoints"
++        self.keep = keep
++
++    @property
++    def latest(self) -> Path:
++        return self.dir / "latest.pt"
++
++    def save_periodic(self, step: int, **state: Any) -> Path:
++        path = self.dir / f"step_{step:010d}.pt"
++        save_checkpoint(path, **state)
++        tmp = self.latest.with_suffix(".pt.tmp")
++        shutil.copyfile(path, tmp)
++        os.replace(tmp, self.latest)
++        self._prune()
++        return path
++
++    def save_phase_start(self, index: int, name: str, **state: Any) -> Path:
++        path = self.dir / f"phase_{index}_{name}_start.pt"
++        save_checkpoint(path, **state)
++        return path
++
++    def _prune(self) -> None:
++        if self.keep <= 0:
++            return
++        periodic = sorted(self.dir.glob("step_*.pt"))
++        for old in periodic[: max(len(periodic) - self.keep, 0)]:
++            old.unlink()
+diff --git a/src/rl/config.py b/src/rl/config.py
+index bed0310..93044b8 100644
+--- a/src/rl/config.py
++++ b/src/rl/config.py
+@@ -32,7 +32,9 @@ class RunConfig:
+     device: str  # "cpu", "cuda", "mps" or "auto"
+     torch_threads: int
+     checkpoint_every_steps: int
++    keep_checkpoints: int  # periodic checkpoints to keep (0 = keep all); phase snapshots are never pruned
+     log_every_updates: int
++    tensorboard: bool
+ 
+ 
+ @dataclass(frozen=True)
+@@ -60,7 +62,9 @@ class RewardsConfig:
+     tagged_while_carrying: float
+     tag_enemy_carrier: float
+     tag_team_share: float
+-    attacker_potential: float  # reward per cell of path distance saved
++    attacker_potential: float  # reward per cell of path distance saved while heading for the flag
++    attacker_carry_potential: float  # same, while carrying the flag home
++    carry_step_penalty: float  # per step while carrying the flag (makes idling with it costly)
+     defender_potential: float
+     scout_new_cell: float
+     scout_anneal_steps: int  # scout bonus decays linearly to 0 over this many steps
+@@ -154,7 +158,8 @@ def _validate(cfg: RLConfig) -> None:
+     _check(p.epochs >= 1 and p.num_minibatches >= 1, "ppo.epochs/num_minibatches must be >= 1")
+     _check(p.learning_rate > 0 and p.learning_rate_final >= 0, "learning rates must be positive")
+     _check(r.num_envs >= 1 and r.rollout_length >= 1 and r.total_steps >= 1, "rollout sizes must be >= 1")
+-    _check(1 <= r.num_workers <= r.num_envs, "rollout.num_workers must be in [1, num_envs]")
++    _check(0 <= r.num_workers <= r.num_envs, "rollout.num_workers must be in [0, num_envs] (0 = run in the main process)")
++    _check(cfg.run.keep_checkpoints >= 0 and cfg.run.checkpoint_every_steps >= 1, "run.keep_checkpoints must be >= 0 and run.checkpoint_every_steps >= 1")
+     _check(len(cfg.model.conv_channels) >= 1, "model.conv_channels needs at least one layer")
+     _check(cfg.model.kernel_size % 2 == 1, "model.kernel_size must be odd")
+     _check(cfg.features.staleness_horizon >= 1, "features.staleness_horizon must be >= 1")
+diff --git a/src/rl/curriculum.py b/src/rl/curriculum.py
+new file mode 100644
+index 0000000..0d9bf81
+--- /dev/null
++++ b/src/rl/curriculum.py
+@@ -0,0 +1,55 @@
++"""Curriculum controller: decides when training moves to the next phase."""
++
++from __future__ import annotations
++
++from collections import deque
++from typing import Any
++
++from rl.config import PhaseConfig
++
++
++class Curriculum:
++    """A phase ends when the rolling win rate over ``window_episodes`` reaches
++    ``advance_win_rate`` (window must be full) or after ``max_steps`` in that phase.
++    The last phase never ends."""
++
++    def __init__(self, phases: list[PhaseConfig]) -> None:
++        self.phases = phases
++        self.index = 0
++        self.steps_in_phase = 0
++        self._window: deque[float] = deque(maxlen=phases[0].window_episodes)
++
++    @property
++    def phase(self) -> PhaseConfig:
++        return self.phases[self.index]
++
++    @property
++    def is_last(self) -> bool:
++        return self.index == len(self.phases) - 1
++
++    @property
++    def win_rate(self) -> float | None:
++        return sum(self._window) / len(self._window) if self._window else None
++
++    def record(self, outcomes: list[str], steps: int) -> bool:
++        """Add finished episodes ('win'/'draw'/'loss') and env steps; True if the phase advanced."""
++        self._window.extend(1.0 if o == "win" else 0.0 for o in outcomes)
++        self.steps_in_phase += steps
++        if self.is_last:
++            return False
++        full = len(self._window) == self._window.maxlen
++        reached = full and (self.win_rate or 0.0) >= self.phase.advance_win_rate
++        if reached or self.steps_in_phase >= self.phase.max_steps:
++            self.index += 1
++            self.steps_in_phase = 0
++            self._window = deque(maxlen=self.phase.window_episodes)
++            return True
++        return False
++
++    def state_dict(self) -> dict[str, Any]:
++        return {"index": self.index, "steps_in_phase": self.steps_in_phase, "window": list(self._window)}
++
++    def load_state_dict(self, state: dict[str, Any]) -> None:
++        self.index = int(state["index"])
++        self.steps_in_phase = int(state["steps_in_phase"])
++        self._window = deque(state["window"], maxlen=self.phase.window_episodes)
+diff --git a/src/rl/metrics.py b/src/rl/metrics.py
+new file mode 100644
+index 0000000..ab93c96
+--- /dev/null
++++ b/src/rl/metrics.py
+@@ -0,0 +1,100 @@
++"""Episode statistics and the run's metric log (``metrics.jsonl`` + optional TensorBoard)."""
++
++from __future__ import annotations
++
++import json
++import math
++import time
++from collections import defaultdict
++from pathlib import Path
++from typing import Any
++
++import numpy as np
++
++
++def summarize_episodes(infos: list[dict], role_names: list[str]) -> dict[str, float]:
++    """Aggregate finished-episode summaries (from CTFTrainEnv) into scalar metrics."""
++    if not infos:
++        return {}
++    n = len(infos)
++    out: dict[str, float] = {"episodes": float(n)}
++    for outcome in ("win", "draw", "loss"):
++        out[f"{outcome}_rate"] = sum(i["outcome"] == outcome for i in infos) / n
++    out["episode_length"] = float(np.mean([i["length"] for i in infos]))
++    for key in ("pickups", "tags_inflicted", "tags_suffered"):
++        out[key] = float(np.mean([i[key] for i in infos]))
++    returns = np.array([i["return"] for i in infos])
++    for slot, role in enumerate(role_names):
++        out[f"return/slot{slot}_{role}"] = float(returns[:, slot].mean())
++    for name in infos[0]["components"]:
++        out[f"reward/{name}"] = float(np.mean([sum(i["components"][name]) for i in infos]))
++
++    by_opponent: dict[str, list[float]] = defaultdict(list)
++    by_side: dict[str, list[float]] = defaultdict(list)
++    for info in infos:
++        won = 1.0 if info["outcome"] == "win" else 0.0
++        by_opponent[info["opponent"]].append(won)
++        by_side[info["learner_team"].lower()].append(won)
++    for kind, wins in by_opponent.items():
++        out[f"win_rate/opp_{kind}"] = sum(wins) / len(wins)
++    for side, wins in by_side.items():
++        out[f"win_rate/side_{side}"] = sum(wins) / len(wins)
++    return out
++
++
++def _clean(value: Any) -> Any:
++    if isinstance(value, (np.floating, np.integer)):
++        value = value.item()
++    if isinstance(value, float) and not math.isfinite(value):
++        return None
++    return value
++
++
++class MetricsLogger:
++    """Appends one JSON object per line; safe to tail while training runs."""
++
++    def __init__(self, run_dir: Path, tensorboard: bool) -> None:
++        run_dir.mkdir(parents=True, exist_ok=True)
++        self.path = run_dir / "metrics.jsonl"
++        self._file = self.path.open("a", encoding="utf-8")
++        self._tb = None
++        if tensorboard:
++            try:
++                from torch.utils.tensorboard import SummaryWriter
++            except ImportError as exc:
++                raise RuntimeError(
++                    "run.tensorboard is true but TensorBoard is not installed; "
++                    "install the rl extra (uv sync --extra rl) or set run.tensorboard: false"
++                ) from exc
++            self._tb = SummaryWriter(log_dir=str(run_dir / "tensorboard"))
++
++    def log(self, step: int, scalars: dict[str, float]) -> None:
++        record = {"step": int(step), "time": time.time(), **{k: _clean(v) for k, v in scalars.items()}}
++        self._file.write(json.dumps(record) + "\n")
++        self._file.flush()
++        if self._tb is not None:
++            for key, value in scalars.items():
++                value = _clean(value)
++                if value is not None:
++                    self._tb.add_scalar(key, value, step)
++
++    def event(self, step: int, name: str, **fields: Any) -> None:
++        record = {"step": int(step), "time": time.time(), "event": name, **fields}
++        self._file.write(json.dumps(record) + "\n")
++        self._file.flush()
++
++    def close(self) -> None:
++        self._file.close()
++        if self._tb is not None:
++            self._tb.close()
++
++
++def read_metrics(path: Path) -> list[dict]:
++    """Read a metrics.jsonl file (ignores a trailing partially written line)."""
++    records = []
++    for line in path.read_text(encoding="utf-8").splitlines():
++        try:
++            records.append(json.loads(line))
++        except json.JSONDecodeError:
++            break
++    return records
+diff --git a/src/rl/rewards.py b/src/rl/rewards.py
+index e50a824..3042197 100644
+--- a/src/rl/rewards.py
++++ b/src/rl/rewards.py
+@@ -29,6 +29,7 @@ COMPONENTS = (
+     "potential",
+     "scout",
+     "step",
++    "carry",
+ )
+ 
+ 
+@@ -88,7 +89,7 @@ class RewardCalculator:
+             if role is Role.ATTACKER:
+                 if agent.carrying_flag:
+                     d_home = self.nav.distance(here, self.own_base)
+-                    phi[slot] = self.cfg.attacker_potential * (self._carry_offset - d_home)
++                    phi[slot] = self.cfg.attacker_carry_potential * (self._carry_offset - d_home)
+                 else:
+                     target = (enemy_flag.x, enemy_flag.y)
+                     phi[slot] = -self.cfg.attacker_potential * self.nav.distance(here, target)
+@@ -166,8 +167,11 @@ class RewardCalculator:
+         for slot in range(n):
+             if self.roles[slot] is Role.SCOUT:
+                 comp["scout"][slot] = cfg.scout_new_cell * scout_scale * fresh[slot]
+-            if prev_agents[self.agent_ids[slot]].active:
++            before = prev_agents[self.agent_ids[slot]]
++            if before.active:
+                 comp["step"][slot] = cfg.step_penalty
++                if before.carrying_flag:
++                    comp["carry"][slot] = cfg.carry_step_penalty
+ 
+         total = sum(comp.values())
+         return RewardResult(total=np.asarray(total, dtype=np.float64), components=comp)
+diff --git a/src/rl/rollout.py b/src/rl/rollout.py
+new file mode 100644
+index 0000000..88f32d8
+--- /dev/null
++++ b/src/rl/rollout.py
+@@ -0,0 +1,57 @@
++"""Rollout collection shared by the trainer and the benchmark."""
++
++from __future__ import annotations
++
++import numpy as np
++import torch
++
++from rl.buffer import RolloutBuffer
++from rl.mappo import ValueNorm
++from rl.networks import ActorCritic
++from rl.vec_env import VecStep
++
++
++def _flat(x: np.ndarray, device: torch.device) -> torch.Tensor:
++    return torch.from_numpy(np.ascontiguousarray(x.reshape(-1, *x.shape[2:]))).to(device)
++
++
++def collect(
++    vec,
++    obs: VecStep,
++    model: ActorCritic,
++    value_norm: ValueNorm,
++    buffer: RolloutBuffer,
++    device: torch.device,
++) -> tuple[VecStep, list[dict]]:
++    """Fill ``buffer`` with ``buffer.T`` steps from every env.
++
++    Returns the observation to continue from and the summaries of episodes that ended.
++    ``buffer.values[T]`` receives the bootstrap value of that final observation.
++    """
++    envs, agents = buffer.E, buffer.A
++    finished: list[dict] = []
++    model.eval()
++    for t in range(buffer.T):
++        grid, vec_in = _flat(obs.grid, device), _flat(obs.vec, device)
++        mask, roles = _flat(obs.mask, device), _flat(obs.role_index, device)
++        c_grid, c_vec = _flat(obs.critic_grid, device), _flat(obs.critic_vec, device)
++        with torch.no_grad():
++            actions, log_probs = model.act(grid, vec_in, mask, roles)
++            values = value_norm.denormalize(model.value(c_grid, c_vec))
++        actions_np = actions.view(envs, agents).cpu().numpy()
++
++        buffer.grid[t], buffer.vec[t], buffer.mask[t] = obs.grid, obs.vec, obs.mask
++        buffer.alive[t], buffer.role_index[t] = obs.alive, obs.role_index
++        buffer.critic_grid[t], buffer.critic_vec[t] = obs.critic_grid, obs.critic_vec
++        buffer.actions[t] = actions_np
++        buffer.log_probs[t] = log_probs.view(envs, agents).cpu().numpy()
++        buffer.values[t] = values.view(envs, agents).double().cpu().numpy()
++
++        obs = vec.step(actions_np)
++        buffer.rewards[t], buffer.dones[t] = obs.rewards, obs.dones
++        finished.extend(obs.infos)
++
++    with torch.no_grad():
++        last = value_norm.denormalize(model.value(_flat(obs.critic_grid, device), _flat(obs.critic_vec, device)))
++    buffer.values[buffer.T] = last.view(envs, agents).double().cpu().numpy()
++    return obs, finished
+diff --git a/src/rl/train.py b/src/rl/train.py
+new file mode 100644
+index 0000000..029d830
+--- /dev/null
++++ b/src/rl/train.py
+@@ -0,0 +1,96 @@
++"""Training entry point.
++
++    python -m rl.train --config configs/rl/default.yaml
++    python -m rl.train --set ppo.learning_rate=0.0001 --set run.name=lr_test
++    python -m rl.train --resume latest
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import platform
++import sys
++import time
++from pathlib import Path
++
++import torch
++import yaml
++
++from ctf.config import config_to_dict
++from rl.checkpoint import git_commit
++from rl.config import config_to_plain, load_base_env_config, load_rl_config
++from rl.schema import ConfigError, parse_override
++from rl.trainer import Trainer
++
++
++def _parser() -> argparse.ArgumentParser:
++    p = argparse.ArgumentParser(description="Train the MAPPO Capture-the-Flag agent.")
++    p.add_argument("--config", default="configs/rl/default.yaml", help="RL config YAML")
++    p.add_argument("--set", action="append", default=[], dest="overrides", metavar="KEY=VALUE",
++                   help="override a config value by dotted path (repeatable)")
++    p.add_argument("--resume", default=None, metavar="latest|PATH",
++                   help="continue from a checkpoint ('latest' = this run's latest.pt)")
++    p.add_argument("--print-config", action="store_true", help="print the resolved config and exit")
++    return p
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = _parser().parse_args(argv)
++    try:
++        overrides = dict(parse_override(text) for text in args.overrides)
++        cfg = load_rl_config(args.config, overrides)
++        env_config = load_base_env_config(cfg, root=Path.cwd())
++    except (ConfigError, ValueError, FileNotFoundError) as exc:
++        print(f"config error: {exc}", file=sys.stderr)
++        return 2
++
++    if args.print_config:
++        print(yaml.safe_dump(config_to_plain(cfg), sort_keys=False))
++        return 0
++
++    run_dir = Path(cfg.run.output_dir) / cfg.run.name
++    resume_path: Path | None = None
++    if args.resume is not None:
++        resume_path = run_dir / "checkpoints" / "latest.pt" if args.resume == "latest" else Path(args.resume)
++        if not resume_path.exists():
++            print(f"cannot resume: {resume_path} does not exist", file=sys.stderr)
++            return 2
++    elif (run_dir / "metrics.jsonl").exists():
++        print(
++            f"run directory {run_dir} already has results. Pick another run.name "
++            f"(--set run.name=...) or continue it with --resume latest.",
++            file=sys.stderr,
++        )
++        return 2
++
++    run_dir.mkdir(parents=True, exist_ok=True)
++    suffix = "" if resume_path is None else f".resume_{int(time.time())}"
++    (run_dir / f"config{suffix}.yaml").write_text(
++        yaml.safe_dump(config_to_plain(cfg), sort_keys=False), encoding="utf-8"
++    )
++    (run_dir / f"env_config{suffix}.yaml").write_text(
++        yaml.safe_dump(config_to_dict(env_config), sort_keys=False), encoding="utf-8"
++    )
++    (run_dir / f"run_info{suffix}.json").write_text(
++        json.dumps({
++            "git_commit": git_commit(),
++            "python": platform.python_version(),
++            "torch": torch.__version__,
++            "platform": platform.platform(),
++            "argv": sys.argv,
++            "started": time.strftime("%Y-%m-%d %H:%M:%S"),
++        }, indent=2),
++        encoding="utf-8",
++    )
++
++    print(f"run: {run_dir}  device: {cfg.run.device}  envs: {cfg.rollout.num_envs}  "
++          f"workers: {cfg.rollout.num_workers}  total steps: {cfg.rollout.total_steps:,}", flush=True)
++    trainer = Trainer(cfg, env_config, run_dir, resume_path)
++    counters = trainer.run()
++    print(f"finished at step {counters['total_steps']:,} (update {counters['update']})")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/rl/trainer.py b/src/rl/trainer.py
+new file mode 100644
+index 0000000..657029c
+--- /dev/null
++++ b/src/rl/trainer.py
+@@ -0,0 +1,171 @@
++"""MAPPO training loop."""
++
++from __future__ import annotations
++
++import time
++from pathlib import Path
++
++import torch
++
++from ctf.config import CTFConfig
++from rl.buffer import RolloutBuffer
++from rl.checkpoint import CheckpointManager, load_checkpoint, restore_training_state
++from rl.config import RLConfig
++from rl.curriculum import Curriculum
++from rl.mappo import MAPPO, ValueNorm
++from rl.metrics import MetricsLogger, summarize_episodes
++from rl.networks import ActorCritic, NetworkSpec
++from rl.rollout import collect
++from rl.vec_env import make_vec_env
++
++
++def resolve_device(name: str) -> torch.device:
++    if name == "auto":
++        if torch.cuda.is_available():
++            return torch.device("cuda")
++        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
++            return torch.device("mps")
++        return torch.device("cpu")
++    return torch.device(name)
++
++
++def _lerp(start: float, end: float, progress: float) -> float:
++    return start + (end - start) * min(max(progress, 0.0), 1.0)
++
++
++class Trainer:
++    def __init__(
++        self,
++        cfg: RLConfig,
++        env_config: CTFConfig,
++        run_dir: Path,
++        resume_from: Path | None = None,
++    ) -> None:
++        self.cfg, self.env_config, self.run_dir = cfg, env_config, run_dir
++        self.device = resolve_device(cfg.run.device)
++        torch.set_num_threads(cfg.run.torch_threads)
++        torch.manual_seed(cfg.run.seed)
++
++        spec = NetworkSpec.from_env(env_config)
++        self.model = ActorCritic(spec, cfg.model).to(self.device)
++        self.value_norm = ValueNorm(cfg.ppo.value_normalization).to(self.device)
++        self.algo = MAPPO(self.model, cfg.ppo, self.value_norm)
++        self.curriculum = Curriculum(cfg.curriculum.phases)
++        self.checkpoints = CheckpointManager(run_dir, cfg.run.keep_checkpoints)
++        self.counters = {"total_steps": 0, "update": 0}
++        if resume_from is not None:
++            payload = load_checkpoint(resume_from, map_location="cpu")
++            self.counters = restore_training_state(
++                payload,
++                model=self.model,
++                optimizer=self.algo.optimizer,
++                value_norm=self.value_norm,
++                curriculum=self.curriculum,
++            )
++        self.buffer = RolloutBuffer(
++            cfg.rollout.rollout_length, cfg.rollout.num_envs, env_config.agents_per_team, spec
++        )
++        self.generator = None if self.device.type == "mps" else torch.Generator(device=self.device)
++        if self.generator is not None:
++            self.generator.manual_seed(cfg.run.seed + self.counters["update"])
++
++    # ------------------------------------------------------------------ helpers
++
++    def _state(self) -> dict:
++        return {
++            "model": self.model,
++            "optimizer": self.algo.optimizer,
++            "value_norm": self.value_norm,
++            "curriculum": self.curriculum,
++            "counters": self.counters,
++            "config": self.cfg,
++            "env_config": self.env_config,
++        }
++
++    def _scalars(self, stats, episodes, lr, entropy_coef, scout_scale, sps) -> dict[str, float]:
++        roles = [r.value for r in self.cfg.roles.slots]
++        scalars = {f"train/{k}": v for k, v in stats.items()}
++        scalars.update({f"episode/{k}": v for k, v in summarize_episodes(episodes, roles).items()})
++        scalars["curriculum/phase"] = float(self.curriculum.index)
++        if self.curriculum.win_rate is not None:
++            scalars["curriculum/rolling_win_rate"] = self.curriculum.win_rate
++        scalars["schedule/learning_rate"] = lr
++        scalars["schedule/entropy_coef"] = entropy_coef
++        scalars["schedule/scout_scale"] = scout_scale
++        scalars["perf/steps_per_sec"] = sps
++        return scalars
++
++    # --------------------------------------------------------------------- train
++
++    def run(self) -> dict[str, int]:
++        cfg = self.cfg
++        steps_per_update = cfg.rollout.rollout_length * cfg.rollout.num_envs
++        # Resumed runs use different env seeds than the segment they continue.
++        seed = cfg.run.seed + self.counters["update"] * cfg.rollout.num_envs
++        vec = make_vec_env(cfg, self.env_config, seed)
++        logger = MetricsLogger(self.run_dir, cfg.run.tensorboard)
++        pending: list[dict] = []
++        window_start, window_steps = time.time(), 0
++        next_checkpoint = (self.counters["total_steps"] // cfg.run.checkpoint_every_steps + 1) * (
++            cfg.run.checkpoint_every_steps
++        )
++        try:
++            vec.set_phase(self.curriculum.index)
++            obs = vec.reset()
++            while self.counters["total_steps"] < cfg.rollout.total_steps:
++                total = self.counters["total_steps"]
++                progress = total / cfg.rollout.total_steps
++                lr = _lerp(cfg.ppo.learning_rate, cfg.ppo.learning_rate_final, progress)
++                entropy_coef = _lerp(cfg.ppo.entropy_coef, cfg.ppo.entropy_coef_final, progress)
++                scout_scale = max(0.0, 1.0 - total / cfg.rewards.scout_anneal_steps)
++                vec.set_scout_scale(scout_scale)
++
++                obs, episodes = collect(vec, obs, self.model, self.value_norm, self.buffer, self.device)
++                self.buffer.compute_gae(cfg.ppo.gamma, cfg.ppo.gae_lambda)
++                self.model.train()
++                stats = self.algo.update(self.buffer.to_batch(self.device), lr, entropy_coef, self.generator)
++
++                self.counters["total_steps"] += steps_per_update
++                self.counters["update"] += 1
++                window_steps += steps_per_update
++                pending.extend(episodes)
++
++                if self.curriculum.record([e["outcome"] for e in episodes], steps_per_update):
++                    phase = self.curriculum.phase
++                    vec.set_phase(self.curriculum.index)
++                    logger.event(self.counters["total_steps"], "phase_advance",
++                                 phase_index=self.curriculum.index, phase=phase.name)
++                    self.checkpoints.save_phase_start(self.curriculum.index, phase.name, **self._state())
++                    print(f"--> phase {self.curriculum.index}: {phase.name}", flush=True)
++
++                if self.counters["update"] % cfg.run.log_every_updates == 0:
++                    sps = window_steps / max(time.time() - window_start, 1e-9)
++                    scalars = self._scalars(stats, pending, lr, entropy_coef, scout_scale, sps)
++                    logger.log(self.counters["total_steps"], scalars)
++                    self._print(scalars)
++                    pending, window_start, window_steps = [], time.time(), 0
++
++                if self.counters["total_steps"] >= next_checkpoint:
++                    self.checkpoints.save_periodic(self.counters["total_steps"], **self._state())
++                    next_checkpoint += cfg.run.checkpoint_every_steps
++            self.checkpoints.save_periodic(self.counters["total_steps"], **self._state())
++        except KeyboardInterrupt:
++            print("\ninterrupted: saving checkpoint...", flush=True)
++            self.checkpoints.save_periodic(self.counters["total_steps"], **self._state())
++        finally:
++            vec.close()
++            logger.close()
++        return dict(self.counters)
++
++    def _print(self, s: dict[str, float]) -> None:
++        phase = self.cfg.curriculum.phases[self.curriculum.index].name
++        win = s.get("episode/win_rate")
++        draw = s.get("episode/draw_rate")
++        episode = f"win {win:.2f} draw {draw:.2f}" if win is not None else "no finished episodes"
++        print(
++            f"upd {self.counters['update']:6d} | step {self.counters['total_steps'] / 1e6:7.3f}M"
++            f" | {s['perf/steps_per_sec']:6.0f} sps | {phase} | {episode}"
++            f" | ent {s['train/entropy']:.2f} | kl {s['train/approx_kl']:.4f}"
++            f" | ev {s['train/explained_variance']:.2f}",
++            flush=True,
++        )
+diff --git a/src/rl/vec_env.py b/src/rl/vec_env.py
+new file mode 100644
+index 0000000..b013326
+--- /dev/null
++++ b/src/rl/vec_env.py
+@@ -0,0 +1,213 @@
++"""Vectorised training environments.
++
++``EnvGroup`` runs several ``CTFTrainEnv`` and returns stacked arrays; it auto-resets
++finished episodes (the returned observation is then the first of the next episode).
++``SubprocVecEnv`` runs one group per worker process (spawn context, so it behaves the
++same on macOS, Windows and Linux); ``InProcessVecEnv`` is the same thing without
++processes, for debugging and tests. Workers never import torch.
++"""
++
++from __future__ import annotations
++
++import multiprocessing as mp
++import traceback
++from dataclasses import dataclass, field
++
++import numpy as np
++
++from ctf.config import CTFConfig
++from rl.config import RLConfig
++from rl.env_wrapper import CTFTrainEnv, EnvStep
++
++
++@dataclass
++class VecStep:
++    grid: np.ndarray  # (E, A, C, H, W)
++    vec: np.ndarray  # (E, A, V)
++    mask: np.ndarray  # (E, A, NUM_ACTIONS)
++    alive: np.ndarray  # (E, A)
++    role_index: np.ndarray  # (E, A)
++    critic_grid: np.ndarray  # (E, A, Cc, H, W)
++    critic_vec: np.ndarray  # (E, A, Vc)
++    rewards: np.ndarray  # (E, A)
++    dones: np.ndarray  # (E,)
++    infos: list[dict] = field(default_factory=list)  # summaries of episodes finished this step
++
++
++def _pack(steps: list[EnvStep], infos: list[dict]) -> VecStep:
++    return VecStep(
++        grid=np.stack([s.actor.grid for s in steps]),
++        vec=np.stack([s.actor.vec for s in steps]),
++        mask=np.stack([s.actor.mask for s in steps]),
++        alive=np.stack([s.actor.alive for s in steps]),
++        role_index=np.stack([s.actor.role_index for s in steps]),
++        critic_grid=np.stack([s.critic.grid for s in steps]),
++        critic_vec=np.stack([s.critic.vec for s in steps]),
++        rewards=np.stack([s.rewards for s in steps]),
++        dones=np.array([float(s.done) for s in steps]),
++        infos=infos,
++    )
++
++
++def _merge(parts: list[VecStep]) -> VecStep:
++    cat = lambda name: np.concatenate([getattr(p, name) for p in parts], axis=0)  # noqa: E731
++    return VecStep(
++        grid=cat("grid"), vec=cat("vec"), mask=cat("mask"), alive=cat("alive"),
++        role_index=cat("role_index"), critic_grid=cat("critic_grid"), critic_vec=cat("critic_vec"),
++        rewards=cat("rewards"), dones=cat("dones"),
++        infos=[info for p in parts for info in p.infos],
++    )
++
++
++class EnvGroup:
++    def __init__(self, cfg: RLConfig, base_env_config: CTFConfig, seeds: list[int]) -> None:
++        self.envs = [CTFTrainEnv(cfg, base_env_config, seed) for seed in seeds]
++
++    def reset(self) -> VecStep:
++        return _pack([env.reset() for env in self.envs], [])
++
++    def step(self, actions: np.ndarray) -> VecStep:
++        steps: list[EnvStep] = []
++        infos: list[dict] = []
++        for env, act in zip(self.envs, actions):
++            result = env.step(act)
++            if result.done:
++                infos.append(result.info)
++                fresh = env.reset()
++                result = EnvStep(fresh.actor, fresh.critic, result.rewards, True, result.info)
++            steps.append(result)
++        return _pack(steps, infos)
++
++    def set_phase(self, index: int) -> None:
++        for env in self.envs:
++            env.set_phase(index)
++
++    def set_scout_scale(self, scale: float) -> None:
++        for env in self.envs:
++            env.set_scout_scale(scale)
++
++
++def _split(items: list[int], parts: int) -> list[list[int]]:
++    size, extra = divmod(len(items), parts)
++    out, start = [], 0
++    for i in range(parts):
++        end = start + size + (1 if i < extra else 0)
++        out.append(items[start:end])
++        start = end
++    return out
++
++
++class InProcessVecEnv:
++    def __init__(self, cfg: RLConfig, base_env_config: CTFConfig, seed: int) -> None:
++        self.num_envs = cfg.rollout.num_envs
++        self.num_agents = base_env_config.agents_per_team
++        self._group = EnvGroup(cfg, base_env_config, [seed + i for i in range(self.num_envs)])
++
++    def reset(self) -> VecStep:
++        return self._group.reset()
++
++    def step(self, actions: np.ndarray) -> VecStep:
++        return self._group.step(actions)
++
++    def set_phase(self, index: int) -> None:
++        self._group.set_phase(index)
++
++    def set_scout_scale(self, scale: float) -> None:
++        self._group.set_scout_scale(scale)
++
++    def close(self) -> None:
++        pass
++
++
++def _worker_main(conn, cfg: RLConfig, base_env_config: CTFConfig, seeds: list[int]) -> None:
++    try:
++        group = EnvGroup(cfg, base_env_config, seeds)
++        while True:
++            command, payload = conn.recv()
++            if command == "reset":
++                conn.send(("ok", group.reset()))
++            elif command == "step":
++                conn.send(("ok", group.step(payload)))
++            elif command == "set_phase":
++                group.set_phase(payload)
++                conn.send(("ok", None))
++            elif command == "set_scout_scale":
++                group.set_scout_scale(payload)
++                conn.send(("ok", None))
++            elif command == "close":
++                break
++    except Exception:  # report the traceback to the parent instead of dying silently
++        conn.send(("error", traceback.format_exc()))
++    finally:
++        conn.close()
++
++
++class SubprocVecEnv:
++    def __init__(self, cfg: RLConfig, base_env_config: CTFConfig, seed: int) -> None:
++        self.num_envs = cfg.rollout.num_envs
++        self.num_agents = base_env_config.agents_per_team
++        ctx = mp.get_context("spawn")
++        env_ids = list(range(self.num_envs))
++        self._slices = _split(env_ids, cfg.rollout.num_workers)
++        self._conns, self._procs = [], []
++        for ids in self._slices:
++            parent, child = ctx.Pipe()
++            proc = ctx.Process(
++                target=_worker_main,
++                args=(child, cfg, base_env_config, [seed + i for i in ids]),
++                daemon=True,
++            )
++            proc.start()
++            child.close()
++            self._conns.append(parent)
++            self._procs.append(proc)
++
++    def _recv_all(self) -> list:
++        results = []
++        for conn in self._conns:
++            status, payload = conn.recv()
++            if status == "error":
++                self.close()
++                raise RuntimeError(f"environment worker crashed:\n{payload}")
++            results.append(payload)
++        return results
++
++    def reset(self) -> VecStep:
++        for conn in self._conns:
++            conn.send(("reset", None))
++        return _merge(self._recv_all())
++
++    def step(self, actions: np.ndarray) -> VecStep:
++        for conn, ids in zip(self._conns, self._slices):
++            conn.send(("step", actions[ids[0] : ids[-1] + 1]))
++        return _merge(self._recv_all())
++
++    def _broadcast(self, command: str, payload) -> None:
++        for conn in self._conns:
++            conn.send((command, payload))
++        self._recv_all()
++
++    def set_phase(self, index: int) -> None:
++        self._broadcast("set_phase", index)
++
++    def set_scout_scale(self, scale: float) -> None:
++        self._broadcast("set_scout_scale", float(scale))
++
++    def close(self) -> None:
++        for conn in self._conns:
++            try:
++                conn.send(("close", None))
++            except (BrokenPipeError, OSError):
++                pass
++        for proc in self._procs:
++            proc.join(timeout=5)
++            if proc.is_alive():
++                proc.terminate()
++        self._conns, self._procs = [], []
++
++
++def make_vec_env(cfg: RLConfig, base_env_config: CTFConfig, seed: int):
++    """``rollout.num_workers == 0`` runs in this process; otherwise one process per worker."""
++    if cfg.rollout.num_workers == 0:
++        return InProcessVecEnv(cfg, base_env_config, seed)
++    return SubprocVecEnv(cfg, base_env_config, seed)
+diff --git a/tests/rl_helpers.py b/tests/rl_helpers.py
+index e328795..c5686b5 100644
+--- a/tests/rl_helpers.py
++++ b/tests/rl_helpers.py
+@@ -33,3 +33,32 @@ def small_env_config(**overrides) -> CTFConfig:
+     )
+     base.update(overrides)
+     return CTFConfig(**base)
++
++
++def tiny_config(
++    output_dir: str,
++    *,
++    num_envs: int = 2,
++    num_workers: int = 0,
++    rollout_length: int = 8,
++    total_steps: int = 48,
++    phases: int = 1,
++    checkpoint_every_steps: int = 16,
++    first_phase_max_steps: int | None = None,
++) -> RLConfig:
++    """A fast config for trainer tests: tiny network, few envs, a handful of updates."""
++    cfg = rl_config()
++    all_phases = cfg.curriculum.phases
++    chosen = all_phases[1:2] if phases == 1 else all_phases[:phases]
++    if first_phase_max_steps is not None:
++        chosen = [replace(chosen[0], max_steps=first_phase_max_steps), *chosen[1:]]
++    return replace(
++        cfg,
++        run=replace(cfg.run, output_dir=output_dir, name="t", tensorboard=False,
++                    checkpoint_every_steps=checkpoint_every_steps, keep_checkpoints=2),
++        env=replace(cfg.env, config_path=str(ROOT / "configs" / "default.yaml")),
++        model=replace(cfg.model, conv_channels=[4], hidden_size=16),
++        rollout=replace(cfg.rollout, num_envs=num_envs, num_workers=num_workers,
++                        rollout_length=rollout_length, total_steps=total_steps),
++        curriculum=replace(cfg.curriculum, phases=chosen),
++    )
+diff --git a/tests/test_rl_algorithm.py b/tests/test_rl_algorithm.py
+index e0e98ff..3b23768 100644
+--- a/tests/test_rl_algorithm.py
++++ b/tests/test_rl_algorithm.py
+@@ -178,3 +178,16 @@ def test_eliminated_agents_get_no_policy_gradient_but_train_the_critic() -> None
+     assert stats["policy_loss"] == 0.0 and stats["entropy"] == 0.0
+     assert all(torch.equal(a, b) for a, b in zip(before_actor, model.actor_encoder.parameters()))
+     assert any(not torch.equal(a, b) for a, b in zip(before_critic, model.critic_encoder.parameters()))
++
++
++def test_benchmark_reports_positive_timings(tmp_path) -> None:
++    from rl.benchmark import measure
++    from rl_helpers import DEFAULT_RL_YAML
++
++    overrides = {
++        "model.conv_channels": [4], "model.hidden_size": 16, "rollout.num_envs": 2,
++        "rollout.rollout_length": 4, "rollout.num_workers": 0, "run.torch_threads": 1,
++        "env.config_path": str(ROOT / "configs" / "default.yaml"),
++    }
++    result = measure(str(DEFAULT_RL_YAML), overrides, workers=0, updates=1)
++    assert result["rollout_s"] > 0 and result["update_s"] > 0 and result["steps_per_sec"] > 0
+diff --git a/tests/test_rl_checkpoint.py b/tests/test_rl_checkpoint.py
+new file mode 100644
+index 0000000..c3c1df5
+--- /dev/null
++++ b/tests/test_rl_checkpoint.py
+@@ -0,0 +1,106 @@
++import pytest
++
++torch = pytest.importorskip("torch")
++
++import numpy as np  # noqa: E402
++
++from rl.checkpoint import (  # noqa: E402
++    CheckpointError,
++    CheckpointManager,
++    load_checkpoint,
++    load_policy,
++    restore_training_state,
++    save_checkpoint,
++)
++from rl.config import load_base_env_config  # noqa: E402
++from rl.trainer import Trainer  # noqa: E402
++from rl_helpers import ROOT, tiny_config  # noqa: E402
++
++
++def _trainer(tmp_path, **kw) -> Trainer:
++    cfg = tiny_config(str(tmp_path), **kw)
++    return Trainer(cfg, load_base_env_config(cfg, ROOT), tmp_path / "run")
++
++
++def _logits(model, seed=0):
++    g = torch.Generator().manual_seed(seed)
++    spec = model.spec
++    grid = torch.rand(3, spec.actor_channels, spec.height, spec.width, generator=g)
++    vec = torch.rand(3, spec.actor_vec_dim, generator=g)
++    mask = torch.ones(3, spec.num_actions, dtype=torch.bool)
++    return model.policy(grid, vec, mask, torch.tensor([0, 1, 2])).logits
++
++
++def test_round_trip_restores_everything(tmp_path) -> None:
++    a = _trainer(tmp_path)
++    a.counters.update(total_steps=123, update=7)
++    a.curriculum.record(["win", "loss"], 20)
++    a.value_norm.update(torch.randn(100) * 5 + 3)
++    path = tmp_path / "ck.pt"
++    save_checkpoint(path, **a._state())
++    assert not list(tmp_path.glob("*.tmp"))
++
++    b = _trainer(tmp_path / "other")
++    counters = restore_training_state(
++        load_checkpoint(path), model=b.model, optimizer=b.algo.optimizer,
++        value_norm=b.value_norm, curriculum=b.curriculum,
++    )
++    assert counters == {"total_steps": 123, "update": 7}
++    assert torch.equal(_logits(a.model), _logits(b.model))
++    assert torch.equal(a.value_norm.mean, b.value_norm.mean) and torch.equal(a.value_norm.var, b.value_norm.var)
++    assert b.curriculum.state_dict() == a.curriculum.state_dict()
++
++
++def test_observation_layout_mismatch_is_refused(tmp_path) -> None:
++    t = _trainer(tmp_path)
++    path = tmp_path / "ck.pt"
++    save_checkpoint(path, **t._state())
++    payload = torch.load(path, weights_only=True)
++    payload["obs_spec"]["actor_channels"] = payload["obs_spec"]["actor_channels"][:-1]
++    torch.save(payload, path)
++    with pytest.raises(CheckpointError, match="observation layout"):
++        load_checkpoint(path)
++    with pytest.raises(CheckpointError, match="not found"):
++        load_checkpoint(tmp_path / "missing.pt")
++
++
++def test_model_size_mismatch_is_reported_clearly(tmp_path) -> None:
++    t = _trainer(tmp_path)
++    path = tmp_path / "ck.pt"
++    save_checkpoint(path, **t._state())
++    bigger = _trainer(tmp_path / "big")
++    bigger_cfg = tiny_config(str(tmp_path / "big2"))
++    from dataclasses import replace
++    bigger_cfg = replace(bigger_cfg, model=replace(bigger_cfg.model, hidden_size=32))
++    other = Trainer(bigger_cfg, load_base_env_config(bigger_cfg, ROOT), tmp_path / "run3")
++    with pytest.raises(CheckpointError, match="do not fit"):
++        restore_training_state(load_checkpoint(path), model=other.model, optimizer=other.algo.optimizer,
++                               value_norm=other.value_norm, curriculum=other.curriculum)
++    del bigger
++
++
++def test_load_policy_rebuilds_the_network_for_inference(tmp_path) -> None:
++    t = _trainer(tmp_path)
++    path = tmp_path / "ck.pt"
++    save_checkpoint(path, **t._state())
++    model, meta = load_policy(path)
++    assert not model.training
++    assert torch.equal(_logits(model), _logits(t.model))
++    assert meta["env_config"].width == 11 and meta["config"].model.hidden_size == 16
++    assert isinstance(meta["git_commit"], str)
++
++
++def test_manager_prunes_periodic_checkpoints_but_keeps_phase_snapshots(tmp_path) -> None:
++    t = _trainer(tmp_path)
++    manager = CheckpointManager(tmp_path / "run2", keep=2)
++    manager.save_phase_start(1, "next", **t._state())
++    for step in (100, 200, 300, 400):
++        manager.save_periodic(step, **t._state())
++    names = sorted(p.name for p in manager.dir.glob("*.pt"))
++    assert names == ["latest.pt", "phase_1_next_start.pt", "step_0000000300.pt", "step_0000000400.pt"]
++    assert load_checkpoint(manager.latest)["counters"] == t.counters
++    keep_all = CheckpointManager(tmp_path / "run3", keep=0)
++    for step in (1, 2, 3):
++        keep_all.save_periodic(step, **t._state())
++    assert len(list(keep_all.dir.glob("step_*.pt"))) == 3
++    assert np.isfinite(float(t.value_norm.var))
+diff --git a/tests/test_rl_curriculum.py b/tests/test_rl_curriculum.py
+new file mode 100644
+index 0000000..279de00
+--- /dev/null
++++ b/tests/test_rl_curriculum.py
+@@ -0,0 +1,57 @@
++from dataclasses import replace
++
++from rl.curriculum import Curriculum
++from rl_helpers import rl_config
++
++
++def _curriculum(window: int = 4, advance: float = 0.75, max_steps: int = 1000) -> Curriculum:
++    base = rl_config().curriculum.phases
++    first = replace(base[0], window_episodes=window, advance_win_rate=advance, max_steps=max_steps)
++    second = replace(base[1], window_episodes=window, advance_win_rate=advance, max_steps=max_steps)
++    return Curriculum([first, second, replace(base[2], window_episodes=window)])
++
++
++def test_advances_when_a_full_window_reaches_the_win_rate() -> None:
++    c = _curriculum()
++    assert not c.record(["win", "win", "win"], 30)  # window not full yet
++    assert c.index == 0
++    assert c.record(["win"], 10)  # 4/4 wins
++    assert c.index == 1 and c.steps_in_phase == 0 and c.win_rate is None
++
++
++def test_does_not_advance_below_the_threshold() -> None:
++    c = _curriculum()
++    assert not c.record(["win", "loss", "draw", "win"], 40)  # 0.5 < 0.75
++    assert c.index == 0 and c.win_rate == 0.5
++
++
++def test_rolling_window_forgets_old_episodes() -> None:
++    c = _curriculum()
++    c.record(["loss"] * 4, 40)
++    assert c.index == 0
++    assert c.record(["win"] * 4, 40)  # losses rolled out of the window
++
++
++def test_advances_after_max_steps_even_with_a_poor_win_rate() -> None:
++    c = _curriculum(max_steps=100)
++    assert not c.record(["loss"], 60)
++    assert c.record(["loss"], 60)
++    assert c.index == 1
++
++
++def test_last_phase_never_advances() -> None:
++    c = _curriculum(max_steps=10)
++    c.record(["win"] * 4, 100)
++    c.record(["win"] * 4, 100)
++    assert c.is_last and c.index == 2
++    assert not c.record(["win"] * 50, 10**9) and c.index == 2
++
++
++def test_state_round_trip_restores_progress() -> None:
++    a = _curriculum()
++    a.record(["win", "loss"], 50)
++    state = a.state_dict()
++    b = _curriculum()
++    b.load_state_dict(state)
++    assert (b.index, b.steps_in_phase, b.win_rate) == (a.index, a.steps_in_phase, a.win_rate)
++    assert b.record(["win", "win"], 10) == a.record(["win", "win"], 10)
+diff --git a/tests/test_rl_metrics.py b/tests/test_rl_metrics.py
+new file mode 100644
+index 0000000..975aa79
+--- /dev/null
++++ b/tests/test_rl_metrics.py
+@@ -0,0 +1,46 @@
++import json
++
++import numpy as np
++import pytest
++
++from rl.metrics import MetricsLogger, read_metrics, summarize_episodes
++
++
++def _info(outcome, opponent="stay", team="RED", ret=(1.0, 2.0, 3.0)):
++    return {
++        "outcome": outcome, "length": 10, "learner_team": team, "opponent": opponent,
++        "pickups": 1, "tags_inflicted": 0, "tags_suffered": 1, "phase": "p", "fixed_spawns": False,
++        "return": list(ret), "components": {"outcome": [1.0, 1.0, 1.0], "step": [-0.1, -0.1, -0.1]},
++    }
++
++
++def test_summary_aggregates_rates_returns_and_breakdowns() -> None:
++    infos = [_info("win"), _info("loss", opponent="random", team="BLUE"), _info("draw"), _info("win")]
++    s = summarize_episodes(infos, ["attacker", "defender", "scout"])
++    assert s["episodes"] == 4 and s["win_rate"] == 0.5 and s["loss_rate"] == 0.25 and s["draw_rate"] == 0.25
++    assert s["return/slot0_attacker"] == 1.0 and s["return/slot2_scout"] == 3.0
++    assert s["win_rate/opp_stay"] == pytest.approx(2 / 3) and s["win_rate/opp_random"] == 0.0
++    assert s["win_rate/side_red"] == pytest.approx(2 / 3) and s["win_rate/side_blue"] == 0.0
++    assert s["reward/outcome"] == pytest.approx(3.0) and s["reward/step"] == pytest.approx(-0.3)
++    assert summarize_episodes([], ["a"]) == {}
++
++
++def test_logger_writes_jsonl_events_and_cleans_non_finite_values(tmp_path) -> None:
++    logger = MetricsLogger(tmp_path, tensorboard=False)
++    logger.log(100, {"a": 1.5, "bad": float("nan"), "np": np.float32(2.0)})
++    logger.event(200, "phase_advance", phase="x")
++    logger.close()
++    rows = read_metrics(tmp_path / "metrics.jsonl")
++    assert rows[0]["step"] == 100 and rows[0]["a"] == 1.5 and rows[0]["bad"] is None and rows[0]["np"] == 2.0
++    assert rows[1]["event"] == "phase_advance" and rows[1]["phase"] == "x"
++
++
++def test_logger_appends_across_runs_and_reader_ignores_a_torn_last_line(tmp_path) -> None:
++    for step in (1, 2):
++        logger = MetricsLogger(tmp_path, tensorboard=False)
++        logger.log(step, {"v": step})
++        logger.close()
++    with (tmp_path / "metrics.jsonl").open("a") as f:
++        f.write('{"step": 3, "v"')  # half-written line (training still running)
++    assert [r["step"] for r in read_metrics(tmp_path / "metrics.jsonl")] == [1, 2]
++    json.loads((tmp_path / "metrics.jsonl").read_text().splitlines()[0])
+diff --git a/tests/test_rl_rewards.py b/tests/test_rl_rewards.py
+index ecf5528..c53d5cb 100644
+--- a/tests/test_rl_rewards.py
++++ b/tests/test_rl_rewards.py
+@@ -44,7 +44,7 @@ def _advance(env, calc, prev, red_actions, blue_actions=None, scout_scale=1.0):
+ 
+ 
+ def test_potential_shaping_telescopes_when_undiscounted() -> None:
+-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1))
++    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1))
+     total = 0.0
+     # R1 starts at (3,1); BLUE flag is at (4,1): one step right = pickup
+     glob2, res, _ = _advance(env, calc, glob.agents, {"R1": Action.RIGHT})
+@@ -54,7 +54,7 @@ def test_potential_shaping_telescopes_when_undiscounted() -> None:
+ 
+ 
+ def test_potential_is_continuous_across_pickup_and_rewards_carrying_home() -> None:
+-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1))
++    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1))
+     prev = glob.agents
+     total = 0.0
+     for action in [Action.RIGHT, Action.LEFT, Action.LEFT, Action.LEFT, Action.LEFT]:
+@@ -69,7 +69,7 @@ def test_potential_is_continuous_across_pickup_and_rewards_carrying_home() -> No
+ 
+ def test_discounted_shaping_matches_formula() -> None:
+     gamma = 0.9
+-    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1), gamma=gamma)
++    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.1), gamma=gamma)
+     phi0 = -0.1 * 1
+     _, res, _ = _advance(env, calc, glob.agents, {"R1": Action.RIGHT})
+     assert res.components["potential"][0] == pytest.approx(gamma * 0.0 - phi0)
+@@ -144,3 +144,25 @@ def test_step_penalty_applies_to_active_agents_only() -> None:
+     glob, res, _ = _advance(env, calc, glob.agents, {})
+     assert res.components["step"].tolist() == [0.0, -0.1, -0.1]
+     assert isinstance(res.total, np.ndarray) and res.total.shape == (3,)
++
++
++def test_carry_potential_has_its_own_weight_and_total_shaping_is_weight_independent() -> None:
++    env, calc, glob = _setup(_zero_rewards(attacker_potential=0.1, attacker_carry_potential=0.3))
++    prev, per_step = glob.agents, []
++    for action in [Action.RIGHT, Action.LEFT, Action.LEFT, Action.LEFT, Action.LEFT]:
++        glob, res, _ = _advance(env, calc, prev, {"R1": action})
++        prev = glob.agents
++        per_step.append(res.components["potential"][0])
++    assert per_step[1] == pytest.approx(0.3) and per_step[2] == pytest.approx(0.3)  # carrying: 0.3 per cell
++    assert per_step[0] == pytest.approx(0.1)  # approach/pickup step: 0.1
++    assert sum(per_step) == pytest.approx(0.1)  # telescopes (terminal potential 0), whatever the weights
++
++
++def test_carry_step_penalty_applies_only_while_carrying() -> None:
++    env, calc, glob = _setup(_zero_rewards(carry_step_penalty=-0.5))
++    prev = glob.agents
++    glob, res, _ = _advance(env, calc, prev, {"R1": Action.RIGHT})  # picks up the flag this step
++    assert res.components["carry"].tolist() == [0.0, 0.0, 0.0]  # not carrying at the start of the step
++    prev = glob.agents
++    glob, res, _ = _advance(env, calc, prev, {"R1": Action.LEFT})
++    assert res.components["carry"].tolist() == [-0.5, 0.0, 0.0]
+diff --git a/tests/test_rl_trainer.py b/tests/test_rl_trainer.py
+new file mode 100644
+index 0000000..1211b60
+--- /dev/null
++++ b/tests/test_rl_trainer.py
+@@ -0,0 +1,83 @@
++import math
++
++import pytest
++import yaml
++
++torch = pytest.importorskip("torch")
++
++from dataclasses import replace  # noqa: E402
++
++from rl.checkpoint import load_checkpoint  # noqa: E402
++from rl.config import config_to_plain, load_base_env_config  # noqa: E402
++from rl.metrics import read_metrics  # noqa: E402
++from rl.train import main  # noqa: E402
++from rl.trainer import Trainer  # noqa: E402
++from rl_helpers import ROOT, tiny_config  # noqa: E402
++
++
++def _run(cfg, run_dir, resume=None):
++    trainer = Trainer(cfg, load_base_env_config(cfg, ROOT), run_dir, resume)
++    return trainer, trainer.run()
++
++
++def test_training_runs_logs_and_checkpoints(tmp_path) -> None:
++    cfg = tiny_config(str(tmp_path))  # 3 updates of 2 envs x 8 steps
++    trainer, counters = _run(cfg, tmp_path / "run")
++    assert counters == {"total_steps": 48, "update": 3}
++    rows = [r for r in read_metrics(tmp_path / "run" / "metrics.jsonl") if "event" not in r]
++    assert [r["step"] for r in rows] == [16, 32, 48]
++    for key in ("train/policy_loss", "train/value_loss", "train/entropy", "perf/steps_per_sec",
++                "schedule/learning_rate", "curriculum/phase"):
++        assert key in rows[0]
++        assert all(r[key] is None or math.isfinite(r[key]) for r in rows)
++    assert rows[0]["schedule/learning_rate"] > rows[-1]["schedule/learning_rate"]  # linear decay
++    assert (tmp_path / "run" / "checkpoints" / "latest.pt").exists()
++    assert load_checkpoint(tmp_path / "run" / "checkpoints" / "latest.pt")["counters"]["total_steps"] == 48
++    assert trainer.counters["update"] == 3
++
++
++def test_resume_continues_the_same_run(tmp_path) -> None:
++    run_dir = tmp_path / "run"
++    first, _ = _run(tiny_config(str(tmp_path), total_steps=32), run_dir)
++    latest = run_dir / "checkpoints" / "latest.pt"
++    saved = load_checkpoint(latest)
++    longer = tiny_config(str(tmp_path), total_steps=64)
++    second = Trainer(longer, load_base_env_config(longer, ROOT), run_dir, latest)
++    assert second.counters == saved["counters"] == {"total_steps": 32, "update": 2}
++    for p, q in zip(first.model.parameters(), second.model.parameters()):
++        assert torch.equal(p, q)  # weights restored before any new training
++    assert second.run() == {"total_steps": 64, "update": 4}
++    steps = [r["step"] for r in read_metrics(run_dir / "metrics.jsonl") if "event" not in r]
++    assert steps == [16, 32, 48, 64]
++
++
++def test_phase_advance_is_logged_and_snapshotted(tmp_path) -> None:
++    cfg = tiny_config(str(tmp_path), phases=2, first_phase_max_steps=16)
++    trainer, _ = _run(cfg, tmp_path / "run")
++    assert trainer.curriculum.index == 1
++    events = [r for r in read_metrics(tmp_path / "run" / "metrics.jsonl") if r.get("event") == "phase_advance"]
++    assert len(events) == 1 and events[0]["phase_index"] == 1
++    assert list((tmp_path / "run" / "checkpoints").glob("phase_1_*_start.pt"))
++
++
++def test_training_with_worker_processes(tmp_path) -> None:
++    cfg = tiny_config(str(tmp_path), num_envs=2, num_workers=2, total_steps=32)
++    _, counters = _run(cfg, tmp_path / "run")
++    assert counters["total_steps"] == 32
++
++
++def test_cli_runs_refuses_to_overwrite_and_resumes(tmp_path, capsys, monkeypatch) -> None:
++    cfg = tiny_config(str(tmp_path), total_steps=32)
++    path = tmp_path / "cfg.yaml"
++    path.write_text(yaml.safe_dump(config_to_plain(cfg)))
++    monkeypatch.chdir(tmp_path)
++    assert main(["--config", str(path)]) == 0
++    run_dir = tmp_path / "t"
++    assert (run_dir / "config.yaml").exists() and (run_dir / "env_config.yaml").exists()
++    assert (run_dir / "run_info.json").exists()
++    assert main(["--config", str(path)]) == 2  # same run name again
++    assert "already has results" in capsys.readouterr().err
++    assert main(["--config", str(path), "--set", "rollout.total_steps=48", "--resume", "latest"]) == 0
++    assert load_checkpoint(run_dir / "checkpoints" / "latest.pt")["counters"]["total_steps"] == 48
++    assert main(["--config", str(path), "--set", "ppo.nonsense=1"]) == 2
++    assert main(["--config", str(path), "--resume", "nope.pt", "--set", "run.name=other"]) == 2
+diff --git a/tests/test_rl_vec_env.py b/tests/test_rl_vec_env.py
+new file mode 100644
+index 0000000..7f4d864
+--- /dev/null
++++ b/tests/test_rl_vec_env.py
+@@ -0,0 +1,77 @@
++from dataclasses import replace
++
++import numpy as np
++import pytest
++
++from rl.config import load_base_env_config
++from rl.features import ACTOR_VECTOR
++from rl.vec_env import InProcessVecEnv, SubprocVecEnv, make_vec_env
++from rl_helpers import ROOT, rl_config
++
++FIELDS = ("grid", "vec", "mask", "alive", "role_index", "critic_grid", "critic_vec", "rewards", "dones")
++
++
++def _cfg(workers: int):
++    cfg = rl_config()
++    return replace(cfg, rollout=replace(cfg.rollout, num_envs=4, num_workers=workers))
++
++
++def _same(a, b) -> None:
++    for name in FIELDS:
++        np.testing.assert_array_equal(getattr(a, name), getattr(b, name), err_msg=name)
++    assert a.infos == b.infos
++
++
++@pytest.mark.parametrize("workers", [2, 3])  # 3 workers for 4 envs = uneven split (2, 1, 1)
++def test_subprocess_matches_in_process_exactly(workers: int) -> None:
++    base = load_base_env_config(_cfg(0), ROOT)
++    reference = make_vec_env(_cfg(0), base, seed=5)
++    parallel = make_vec_env(_cfg(workers), base, seed=5)
++    assert isinstance(reference, InProcessVecEnv) and isinstance(parallel, SubprocVecEnv)
++    try:
++        for vec in (reference, parallel):
++            vec.set_phase(2)
++            vec.set_scout_scale(0.5)
++        _same(reference.reset(), parallel.reset())
++        rng = np.random.default_rng(0)
++        finished = 0
++        for _ in range(60):
++            actions = rng.integers(0, 5, size=(4, 3))
++            a, b = reference.step(actions), parallel.step(actions)
++            _same(a, b)
++            finished += len(a.infos)
++        assert finished > 0  # auto-reset path was exercised
++    finally:
++        reference.close()
++        parallel.close()
++
++
++def test_auto_reset_returns_the_next_episodes_first_observation() -> None:
++    base = load_base_env_config(_cfg(0), ROOT)
++    vec = make_vec_env(_cfg(0), base, seed=1)
++    vec.set_phase(0)
++    first = vec.reset()
++    rng = np.random.default_rng(0)
++    step = first
++    for _ in range(400):
++        step = vec.step(rng.integers(0, 5, size=(4, 3)))
++        if step.infos:
++            done_env = int(np.argmax(step.dones))
++            assert step.dones[done_env] == 1.0
++            # a fresh episode starts at t=0 with every agent alive
++            assert step.alive[done_env].all()
++            time_fraction = step.vec[done_env, 0, ACTOR_VECTOR.index("time_fraction")]
++            assert time_fraction == 0.0
++            return
++    pytest.fail("no episode finished in 400 steps")
++
++
++def test_worker_crash_surfaces_the_traceback() -> None:
++    base = load_base_env_config(_cfg(2), ROOT)
++    vec = make_vec_env(_cfg(2), base, seed=0)
++    try:
++        vec.reset()
++        with pytest.raises(RuntimeError, match="environment worker crashed"):
++            vec.step(np.full((4, 3), 99))  # not a valid action index
++    finally:
++        vec.close()

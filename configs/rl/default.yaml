@@ -8,7 +8,9 @@ run:
   device: cpu                      # cpu | cuda | mps | auto  (cpu is fastest for this tiny net)
   torch_threads: 2
   checkpoint_every_steps: 500000
+  keep_checkpoints: 5              # newest periodic checkpoints kept (0 = keep all)
   log_every_updates: 1
+  tensorboard: true                # also write TensorBoard event files
 
 env:
   config_path: configs/default.yaml  # base environment; phases override parts of it below
@@ -28,16 +30,18 @@ rewards:
   tagged_while_carrying: -2.0
   tag_enemy_carrier: 2.0
   tag_team_share: 0.5              # each teammate of the tagger also gets this
-  attacker_potential: 0.05         # per cell of path distance gained toward the objective
+  attacker_potential: 0.05         # per cell of path distance gained toward the enemy flag
+  attacker_carry_potential: 0.2    # per cell gained while carrying the flag home (denser: this is the hard part)
+  carry_step_penalty: -0.02        # per step while carrying; stops 'grab the flag, then freeze'
   defender_potential: 0.02
   scout_new_cell: 0.05             # per newly seen cell (scout role only)
   scout_anneal_steps: 3000000      # scout bonus fades linearly to 0 over this many steps
   step_penalty: -0.002
 
 model:
-  conv_channels: [32, 32, 16]
+  conv_channels: [16, 16]          # PPO update cost scales with this: [32,32,16]/256 is ~2.7x slower
   kernel_size: 3
-  hidden_size: 256
+  hidden_size: 128
 
 ppo:
   learning_rate: 0.0003
@@ -57,31 +61,35 @@ ppo:
 
 rollout:
   num_envs: 16
-  num_workers: 4                   # worker processes; set to (CPU cores - 1), at most num_envs
+  num_workers: 4                   # worker processes, at most num_envs; 0 = run in the main process (debugging)
   rollout_length: 128
-  total_steps: 20000000            # environment steps (one step = both teams moving once)
+  total_steps: 10000000            # environment steps (one step = both teams moving once)
 
 curriculum:
   learner_side: random             # red | blue | random, drawn per episode
   # A phase ends when the rolling win rate over `window_episodes` reaches
   # `advance_win_rate`, or after `max_steps`. The last phase runs to the end.
   phases:
+    # Phase 1 teaches the whole task (grab the flag, run home, capture) with the opponents
+    # starting in the far corners, away from their flag. Starting next to a guarded flag made
+    # the agent learn "grab the flag, then freeze" (measured), so defenders arrive in phase 2.
     - name: learn_the_task
-      max_steps: 2000000
+      max_steps: 1500000
       advance_win_rate: 0.7
       window_episodes: 200
       fixed_spawn_fraction: 0.0
       opponent_noise: 0.0
       env_overrides:
         visibility_radius: 20      # larger than the map = full view
-        spawn_mode: near_base
-        spawn_allow_base: false
+        spawn_mode: shuffle        # same cells, random assignment (corners are mirror-symmetric)
+        red_spawns: [[0, 0], [0, 6], [2, 0]]
+        blue_spawns: [[10, 0], [10, 6], [8, 0]]
       opponents:
         - {kind: stay, weight: 1.0, params: {}}
         - {kind: random, weight: 1.0, params: {}}
 
     - name: handle_defenders
-      max_steps: 4000000
+      max_steps: 3000000
       advance_win_rate: 0.7
       window_episodes: 200
       fixed_spawn_fraction: 0.3
@@ -100,7 +108,7 @@ curriculum:
         - {kind: random, weight: 1.0, params: {}}
 
     - name: real_setting
-      max_steps: 14000000
+      max_steps: 5500000
       advance_win_rate: 1.0        # last phase: runs until rollout.total_steps
       window_episodes: 200
       fixed_spawn_fraction: 0.5

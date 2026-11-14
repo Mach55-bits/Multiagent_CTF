@@ -12,7 +12,8 @@ def _flag_view(flag) -> FlagView:
     return FlagView((flag.x, flag.y), flag.status is FlagStatus.CARRIED, flag.carrier_id)
 
 
-def build_view(obs, team: Team, roles: dict[str, str], enemy_memory: dict, observed, max_steps) -> View:
+def build_view(obs, team: Team, roles: dict[str, str], enemy_memory: dict, observed, max_steps,
+               observers: list | None = None) -> View:
     """Uses ONLY the observation. enemy_memory persists last-seen enemy positions (for fog of war)."""
     own_base = obs.red_base if team is Team.RED else obs.blue_base
     enemy_base = obs.blue_base if team is Team.RED else obs.red_base
@@ -20,14 +21,24 @@ def build_view(obs, team: Team, roles: dict[str, str], enemy_memory: dict, obser
         AgentView(a.agent_id, roles.get(a.agent_id, "attacker"), (a.x, a.y), a.carrying_flag, a.active)
         for a in sorted(obs.agents.values(), key=lambda a: a.agent_id) if a.team is team
     ]
+    radius = getattr(obs, "visibility_radius", None)
+
+    def seen_by_observers(x: int, y: int) -> bool:
+        """With observers given (scout sharing off), only their own eyes count."""
+        if observers is None or radius is None:
+            return True
+        return any(abs(ox - x) + abs(oy - y) <= radius for ox, oy in observers)
+
     for a in obs.agents.values():
         if a.team is team.opponent:
-            if a.active:
+            if a.active and seen_by_observers(a.x, a.y):
                 enemy_memory[a.agent_id] = ((a.x, a.y), obs.timestep)
-            else:
+            elif not a.active:
                 enemy_memory.pop(a.agent_id, None)
     enemies = [(aid, pos, t) for aid, (pos, t) in sorted(enemy_memory.items())]
     enemy_flag = obs.flags.get(team.opponent)
+    if enemy_flag is not None and not enemy_flag.carrier_id and not seen_by_observers(enemy_flag.x, enemy_flag.y):
+        enemy_flag = None
     return View(
         team=team, timestep=obs.timestep, max_steps=max_steps,
         width=obs.width, height=obs.height, obstacles={tuple(o) for o in obs.obstacles},
@@ -63,16 +74,15 @@ def render_map(view: View) -> str:
     return "\n".join(lines)
 
 
-def view_to_text(view: View) -> str:
+def view_to_text(view: View, include_map: bool = True) -> str:
     out = []
     limit = f" of {view.max_steps}" if view.max_steps else ""
     out.append(f"You command team {view.team.value}. Turn {view.timestep}{limit}.")
     out.append(f"Map {view.width}x{view.height}; coordinates are (x, y), x = column, y = row, (0,0) top-left, north = smaller y.")
     out.append("Legend: # wall, . open, ? not yet explored, H our base (our flag's home), X enemy base (enemy flag's home), "
                "e enemy, A/D/S our attacker/defender/scout.")
-    # TODO(4c): ablation "prompt without the map". Add a parameter (e.g. include_map=True) to
-    # view_to_text and skip the next line when it is False.
-    out.append(render_map(view))
+    if include_map:
+        out.append(render_map(view))
     out.append("Our agents:")
     for a in view.agents:
         state = "" if a.active else "  [TAGGED - out of the game]"

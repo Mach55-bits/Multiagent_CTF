@@ -1,8 +1,9 @@
 """Low-level controller: turns orders into the game's UP/DOWN/LEFT/RIGHT/STAY actions.
 
-TODO(5): mixed teams. This is the only place that turns orders into moves. To combine the LLM
-with Team 1's behaviour trees or Team 2's learned policies, write a class with the same methods
-(set_orders, update, report, purge_finished, actions) that forwards each order to their agents.
+This simple version walks shortest paths (BFS). classical_adapter.py provides a drop-in replacement
+that uses Team 1's A* with the influence map and Team 1's role logic for agents without an order.
+
+rl_adapter.py provides a controller that lets Team 2's RL policy play the agents without an order.
 """
 from __future__ import annotations
 
@@ -22,6 +23,9 @@ class Controller:
 
     def reset(self) -> None:
         self.orders.clear(); self.status.clear()
+
+    def attach(self, observation, team, roles) -> None:
+        """Called every turn before actions(); the base controller does not need the raw observation."""
 
     # ---- orders -------------------------------------------------------
     def set_orders(self, orders: list[dict], timestep: int) -> None:
@@ -58,7 +62,7 @@ class Controller:
             # TODO(8): a defender standing on its own base cell tags every flag pickup immediately
             # (pickup is resolved before tagging), which makes that base unbeatable. Once the group
             # has decided how to handle this (rule change or a different defender behaviour),
-            # update this branch accordingly.
+            # update this branch accordingly. Measurements: docs/stalemate_findings.md.
             if view.own_flag.carried:             # reflex: chase the thief
                 return view.own_flag.pos, None
             return view.own_base, None

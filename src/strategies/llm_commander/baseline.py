@@ -12,10 +12,9 @@ from .commands import assign_roles
 from .controller import Controller
 from .view import build_view
 
-# TODO(6): these opponent styles are provisional. Replace them with the group's agreed definitions of
-# "aggressive", "defensive" and "balanced" (and, if needed, with Team 1's classical agents).
-# TODO(8): the "balanced" and "defensive" styles keep a defender on its base cell, which ends most
-# games without a winner; revisit them together with the rule decision in controller.py.
+# Simple scripted teams on this package's own controller. "baseline" (role defaults) is the lowest
+# baseline for comparisons; opponents for the experiments come from opponents.py.
+# Note: "balanced" and "defensive" keep a defender on its base cell (see TODO(8) in controller.py).
 # agent number (1,2,3) -> default command
 STYLES = {
     "baseline":   {},                                                        # role defaults
@@ -31,9 +30,13 @@ class ScriptedStrategy(BaseStrategy):
             raise ValueError(f"style must be one of {sorted(STYLES)}")
         self.style, self.controller, self.roles, self.last_t, self.mem = style, Controller(), {}, -1, {}
 
+    def reset(self) -> None:
+        self.controller.reset()
+        self.roles, self.mem, self.last_t = {}, {}, -1
+
     def act(self, observation: TeamObservation, team: Team) -> dict[str, Action]:
         if observation.timestep <= self.last_t:
-            self.controller.reset(); self.roles = {}; self.mem = {}
+            self.reset()
         self.last_t = observation.timestep
         if not self.roles:
             ids = [a.agent_id for a in observation.agents.values() if a.team is team]

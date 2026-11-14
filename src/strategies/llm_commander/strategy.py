@@ -14,24 +14,53 @@ from .view import build_view
 
 
 class LLMCommanderStrategy(BaseStrategy):
-    """High-level orders from an LLM, executed by a simple low-level controller.
+    """High-level orders from an LLM, executed by a low-level controller.
 
-    Works with global observations now and partial ones later (it only uses what the observation shows).
+    Works with global and partial observations (it only uses what the observation shows).
     Create ONE instance per team and per game.
+
+    controller:        "simple" (BFS walker), "classical" (Team 1's A*, influence map and role logic),
+                       "rl" (Team 2's trained policy plays every agent that has no order; needs a checkpoint)
+                       or a ready-made Controller object
+    use_validator:     False = ablation, orders are executed without legality checks
+    include_map:       False = ablation, the prompt has no ASCII map
+    share_scout_info:  False = ablation (partial observability only), the scout's observations are
+                       not merged into what the commander knows
     """
 
     def __init__(self, llm, every_k_turns: int = 5, max_retries: int = 2,
-                 log_path: str | None = None, max_steps: int | None = None) -> None:
-        self.commander = Commander(llm, every_k_turns, max_retries, log_path)
-        # TODO(5): mixed teams. To let the LLM command Team 1's behaviour-tree agents or Team 2's
-        # learned policies, replace this Controller with an adapter that has the same methods
-        # (update, report, set_orders, purge_finished, actions); see controller.py.
-        self.controller = Controller()
-        self.max_steps = max_steps
-        self._reset_memory()
+                 log_path: str | None = None, max_steps: int | None = None,
+                 controller: str = "simple", use_validator: bool = True,
+                 include_map: bool = True, share_scout_info: bool = True,
+                 rl_checkpoint: str | None = None) -> None:
+        if isinstance(controller, str) and controller not in ("simple", "classical", "rl"):
+            raise ValueError("controller must be 'simple', 'classical', 'rl' or a Controller object")
+        self.commander = Commander(llm, every_k_turns, max_retries, log_path,
+                                   use_validator=use_validator, include_map=include_map)
+        self.controller_kind = controller if isinstance(controller, str) else "custom"
+        if not isinstance(controller, str):
+            self.controller = controller                 # any object with the Controller methods
+        elif controller == "classical":
+            from .classical_adapter import ClassicalControllerAdapter
 
-    # ---- internal bookkeeping ------------------------------------------
-    def _reset_memory(self) -> None:
+            self.controller = ClassicalControllerAdapter()
+        elif controller == "rl":
+            from .rl_adapter import RLControllerAdapter
+
+            self.controller = RLControllerAdapter(rl_checkpoint)
+        else:
+            self.controller = Controller()
+        self.max_steps = max_steps
+        self.share_scout_info = share_scout_info
+        self.reset()
+
+    @property
+    def needs_partial_observation(self) -> bool:
+        """The RL policy was trained with fog of war, so it must be given partial observations."""
+        return bool(getattr(self.controller, "needs_partial_observation", False))
+
+    # ---- per-game memory ---------------------------------------------------
+    def reset(self) -> None:
         self.controller.reset()
         self.roles: dict[str, str] = {}
         self.enemy_memory: dict = {}
@@ -39,18 +68,27 @@ class LLMCommanderStrategy(BaseStrategy):
         self.prev_view = None
         self.last_t = -1
         self.timeline: list[str] = []      # human-readable record of orders/events for printing
+        self.moves: dict[str, int] = {}    # moves (actions other than STAY) per agent, this game
 
-    def _observed_cells(self, obs: TeamObservation, team: Team):
+    def _team_knowledge(self, obs: TeamObservation, team: Team):
+        """Returns (observed cells or None, observer positions or None) for the view."""
         if obs.mode is not ObservationMode.PARTIAL:
-            return None                      # global: the whole map is visible
-        from coordination.shared_map import SharedTeamMap, update_shared_map_from_partial_team
+            return None, None                # global: the whole map is visible
+        from coordination.shared_map import SharedTeamMap, build_scout_view_from_partial
 
         if self.shared_map is None:
             self.shared_map = SharedTeamMap(obs.width, obs.height, team)
-        # TODO(4d): scout information sharing on/off. Add a flag (e.g. share_scout_info=True). When it
-        # is False, do not merge the scout's view into the team map (use only each agent's own view).
-        update_shared_map_from_partial_team(self.shared_map, obs)
-        return {(x, y) for y in range(obs.height) for x in range(obs.width) if self.shared_map.is_observed(x, y)}
+        observers = []
+        for agent_id, agent in obs.agents.items():
+            if agent.team is not team or not agent.active:
+                continue
+            if not self.share_scout_info and self.roles.get(agent_id) == "scout":
+                continue                     # scout sharing off: its observations are not merged
+            self.shared_map.update_from_scout(build_scout_view_from_partial(obs, agent_id))
+            observers.append((agent.x, agent.y))
+        observed = {(x, y) for y in range(obs.height) for x in range(obs.width)
+                    if self.shared_map.is_observed(x, y)}
+        return observed, (None if self.share_scout_info else observers)
 
     @staticmethod
     def _events(prev, cur) -> list[str]:
@@ -75,15 +113,16 @@ class LLMCommanderStrategy(BaseStrategy):
     # ---- the BaseStrategy method -----------------------------------------
     def act(self, observation: TeamObservation, team: Team) -> dict[str, Action]:
         if observation.timestep <= self.last_t:        # new game started
-            self._reset_memory()
+            self.reset()
         self.last_t = observation.timestep
         if not self.roles:
             self.roles = assign_roles([a.agent_id for a in observation.agents.values() if a.team is team])
 
-        observed = self._observed_cells(observation, team)
-        view = build_view(observation, team, self.roles, self.enemy_memory, observed, self.max_steps)
+        observed, observers = self._team_knowledge(observation, team)
+        view = build_view(observation, team, self.roles, self.enemy_memory, observed, self.max_steps, observers)
         view.events = self._events(self.prev_view, view)
 
+        self.controller.attach(observation, team, self.roles)
         self.controller.update(view)                    # arrived? expired? blocked?
         view.order_status = self.controller.report()
         orders = self.commander.decide(view)            # may call the LLM
@@ -95,7 +134,8 @@ class LLMCommanderStrategy(BaseStrategy):
         self.controller.set_orders(orders, view.timestep)
         self.controller.purge_finished()
         actions = self.controller.actions(view)
-        # TODO(3): movement efficiency. Count here how many moves (actions other than STAY) each
-        # agent makes per game, e.g. in a self.metrics dict, so distance travelled can be reported.
+        for aid, action in actions.items():
+            if action is not Action.STAY:
+                self.moves[aid] = self.moves.get(aid, 0) + 1
         self.prev_view = view
         return actions

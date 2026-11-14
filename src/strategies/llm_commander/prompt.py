@@ -1,8 +1,4 @@
-"""System prompt sent to the LLM (rules, commands, output format).
-
-TODO(1): once the commander has been run with the real LLM, refine this text (rules, command
-descriptions, the output example) using the mistakes visible in the logs/*.jsonl files.
-"""
+"""System prompt sent to the LLM (rules, commands, output format)."""
 from __future__ import annotations
 
 from .commands import View

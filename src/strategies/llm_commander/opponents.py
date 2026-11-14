@@ -4,10 +4,6 @@ Names: aggressive | balanced | defensive | camper | random | stay   (RL branch s
        classical                                                  (Team 1's classical AI)
        rl                                                         (Team 2's trained RL policy, needs a checkpoint)
        baseline                                                   (this package's role-default team)
-
-TODO(6): "aggressive", "balanced" and "defensive" are provisional definitions (see PRESETS). Replace
-them with the group's agreed ones. "camper" keeps its defender on its base cell, which makes that
-base unbeatable (see TODO(8) in controller.py); it is kept as a named stress test.
 """
 from __future__ import annotations
 

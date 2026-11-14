@@ -5,7 +5,7 @@ Plays every combination of  condition x opponent x observability  with the same 
 (the commander plays RED and BLUE on every seed), and writes one CSV row per game plus a summary table.
 Results are appended game by game, so an interrupted run (quota, network) resumes where it stopped.
 
-Examples (from the repository root):
+Examples:
   uv run python scripts/run_experiments.py --dry-run
   uv run python scripts/run_experiments.py --llm mock --games 50
   uv run --with google-genai python scripts/run_experiments.py --llm gemini --games 50 \
@@ -146,10 +146,7 @@ def main() -> None:
                     f.flush()
                     print(f"[{n}/{total_games}] {cond:<18} vs {opp:<10} {mode:<7} {side:<4} seed {seed}: "
                           f"{g.result.upper()} in {g.turns} turns")
-
-    # TODO(7): report and demo. scripts/make_report.py turns results/*.csv into tables, a chart and
-    # candidate demo seeds. Write the report text and record the demo video (re-run the chosen seed with
-    # scripts/run_llm_commander.py; the printed timeline and logs/ show what the LLM did).
+    
     rows = read_rows(out)
     summary = summarise(rows)
     Path(args.summary).parent.mkdir(parents=True, exist_ok=True)

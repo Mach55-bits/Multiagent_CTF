@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Play full Capture the Flag games with a commander (or a baseline) controlling one team.
 
-Examples (run from the repository root):
+Examples:
   uv run python scripts/run_llm_commander.py                            # offline mock LLM vs 'balanced'
   uv run --with google-genai python scripts/run_llm_commander.py --llm gemini --opponent classical
   uv run python scripts/run_llm_commander.py --condition classical      # Team 1's classical AI, no LLM

@@ -12,10 +12,6 @@ from .commands import assign_roles
 from .controller import Controller
 from .view import build_view
 
-# Simple scripted teams on this package's own controller. "baseline" (role defaults) is the lowest
-# baseline for comparisons; opponents for the experiments come from opponents.py.
-# Note: "balanced" and "defensive" keep a defender on its base cell (see TODO(8) in controller.py).
-# agent number (1,2,3) -> default command
 STYLES = {
     "baseline":   {},                                                        # role defaults
     "aggressive": {1: "capture_flag", 2: "capture_flag", 3: "capture_flag"},

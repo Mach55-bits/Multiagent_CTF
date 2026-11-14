@@ -9,11 +9,8 @@ The policy was trained under fog of war, so it always needs a PartialTeamObserva
 need one set `needs_partial_observation = True`; runner.play_game then supplies it, also in games
 that are otherwise played with global observability.
 
-Requires the rl_agent branch, NumPy and PyTorch (uv sync --extra dev --extra rl).
+Requires the rl_agent branch, NumPy and PyTorch (uv sync --extra dev --extra rl)."""
 
-TODO(5): not yet run with a real trained checkpoint (none existed when this was written). Once
-`python -m rl.train` has produced one, run scripts/check_rl.py, then the mixed-team experiments.
-"""
 from __future__ import annotations
 
 from pathlib import Path

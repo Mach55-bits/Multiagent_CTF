@@ -58,11 +58,7 @@ class Controller:
             if ef is not None and ef.carried:     # a teammate already has it
                 return None, "done"
             return view.enemy_base, None
-        if cmd == "defend_base":
-            # TODO(8): a defender standing on its own base cell tags every flag pickup immediately
-            # (pickup is resolved before tagging), which makes that base unbeatable. Once the group
-            # has decided how to handle this (rule change or a different defender behaviour),
-            # update this branch accordingly. Measurements: docs/stalemate_findings.md.
+        if cmd == "defend_base":            
             if view.own_flag.carried:             # reflex: chase the thief
                 return view.own_flag.pos, None
             return view.own_base, None
